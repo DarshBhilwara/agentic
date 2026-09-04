@@ -1,8 +1,13 @@
----
 apiVersion: v1
 kind: Namespace
 metadata:
   name: agentic-ai
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia
 ---
 apiVersion: v1
 kind: PersistentVolume
@@ -37,7 +42,6 @@ spec:
   resources:
     requests:
       storage: 100Gi
-
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -53,6 +57,7 @@ spec:
       labels:
         name: nvidia-device-plugin-ds
     spec:
+      runtimeClassName: nvidia
       tolerations:
       - key: nvidia.com/gpu
         operator: Exists
@@ -74,7 +79,6 @@ spec:
       - name: device-plugin
         hostPath:
           path: /var/lib/kubelet/device-plugins
-
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -91,6 +95,7 @@ spec:
       labels:
         app: vllm
     spec:
+      runtimeClassName: nvidia
       containers:
       - name: vllm
         image: vllm/vllm-openai:latest
@@ -107,11 +112,17 @@ spec:
         - --gpu-memory-utilization
         - "0.92"
         env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
         - name: HUGGING_FACE_HUB_TOKEN
           value: "HUGGINGFACE_TOKEN"
         resources:
           limits:
-            nvidia.com/gpu: 1
+            nvidia.com/gpu: "1"
+          requests:
+            nvidia.com/gpu: "1"
         volumeMounts:
         - name: model-cache
           mountPath: /root/.cache/huggingface
@@ -119,6 +130,7 @@ spec:
       - name: model-cache
         hostPath:
           path: /home/iiitd/Documents/agentic/model-cache
+          type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -133,7 +145,6 @@ spec:
   - port: 8000
     targetPort: 8000
     nodePort: 30800
-
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -153,6 +164,8 @@ spec:
       containers:
       - name: redis
         image: redis:7-alpine
+        ports:
+        - containerPort: 6379
 ---
 apiVersion: v1
 kind: Service
@@ -194,6 +207,7 @@ spec:
       - name: code
         hostPath:
           path: /home/iiitd/Documents/agentic/code
+          type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -248,6 +262,7 @@ spec:
       - name: code
         hostPath:
           path: /home/iiitd/Documents/agentic/code
+          type: DirectoryOrCreate
       - name: workspace
         persistentVolumeClaim:
           claimName: agentic-workspace-pvc
@@ -281,6 +296,7 @@ spec:
       - name: code
         hostPath:
           path: /home/iiitd/Documents/agentic/code
+          type: DirectoryOrCreate
       - name: workspace
         persistentVolumeClaim:
           claimName: agentic-workspace-pvc
