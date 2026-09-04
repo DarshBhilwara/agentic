@@ -61,9 +61,12 @@ spec:
       - image: nvcr.io/nvidia/k8s-device-plugin:v0.14.3
         name: nvidia-device-plugin-ctr
         securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop: ["ALL"]
+          privileged: true
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "all"
         volumeMounts:
         - name: device-plugin
           mountPath: /var/lib/kubelet/device-plugins
@@ -96,13 +99,13 @@ spec:
         - -m
         - vllm.entrypoints.openai.api_server
         - --model
-        - meta-llama/Meta-Llama-3.1-8B-Instruct
+        - Qwen/Qwen2.5-14B-Instruct-AWQ
         - --served-model-name
-        - llama3
+        - qwen
         - --port
         - "8000"
         - --gpu-memory-utilization
-        - "0.9"
+        - "0.92"
         env:
         - name: HUGGING_FACE_HUB_TOKEN
           value: "HUGGINGFACE_TOKEN"
