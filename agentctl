@@ -13,9 +13,18 @@ MAGENTA = '\033[95m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 
-SYSTEM_PROMPT = """You are AgentCTL, an enterprise agentic CLI running locally on K3s.
-When asked to perform tasks on the local system or inspect files, output the shell command inside a ```bash block.
-The CLI will execute it with user permission and feed the terminal output back to you automatically."""
+SYSTEM_PROMPT = """You are AgentCTL, an enterprise CLI assistant running locally on K3s.
+Your job is to assist the user by directly creating files, modifying code, inspecting system state, and executing commands.
+
+STRICT OPERATIONAL RULES:
+1. To write or create files, use standard heredocs in a single bash block, e.g.:
+cat << 'EOF' > filename.py
+# code here
+EOF
+2. Provide EXACTLY ONE ```bash block per response turn when an action is required.
+3. NEVER simulate or hallucinate terminal output, stdout, or stderr inside markdown blocks.
+4. Once an action is executed successfully or a task is complete, summarize the outcome in plain text WITHOUT any further ```bash blocks.
+"""
 
 def get_token():
     if not os.path.exists(TOKEN_FILE):
@@ -57,7 +66,7 @@ def process_llm_turn(messages):
             "messages": messages,
             "stream": True,
             "max_tokens": 4096,
-            "temperature": 0.2
+            "temperature": 0.1
         }
 
         try:
@@ -87,30 +96,30 @@ def process_llm_turn(messages):
         if not bash_blocks:
             break
 
-        for script in bash_blocks:
-            script = script.strip()
-            if not script: continue
+        script = bash_blocks[0].strip()
+        if not script:
+            break
             
-            print(f"\n{YELLOW}⚙️  Action Proposed:{RESET}")
-            print(f"{CYAN}{script}{RESET}")
-            confirm = input(f"{YELLOW}Execute command? [Y/n]: {RESET}").strip().lower()
+        print(f"\n{YELLOW}⚙️  Action Proposed:{RESET}")
+        print(f"{CYAN}{script}{RESET}")
+        confirm = input(f"{YELLOW}Execute command? [Y/n]: {RESET}").strip().lower()
+        
+        if confirm in ['', 'y', 'yes']:
+            result = subprocess.run(script, shell=True, text=True, capture_output=True)
+            output_str = ""
+            if result.stdout: output_str += f"STDOUT:\n{result.stdout}\n"
+            if result.stderr: output_str += f"STDERR:\n{result.stderr}\n"
+            if not output_str: output_str = "Executed successfully with no stdout/stderr."
             
-            if confirm in ['', 'y', 'yes']:
-                result = subprocess.run(script, shell=True, text=True, capture_output=True)
-                output_str = ""
-                if result.stdout: output_str += f"STDOUT:\n{result.stdout}\n"
-                if result.stderr: output_str += f"STDERR:\n{result.stderr}\n"
-                if not output_str: output_str = "Executed successfully with no stdout/stderr."
-                
-                print(f"{CYAN}--- Command Output ---{RESET}\n{output_str.strip()}\n{CYAN}----------------------{RESET}")
-                messages.append({
-                    "role": "user", 
-                    "content": f"Command output:\n{output_str}\nProceed with the task."
-                })
-                break 
-            else:
-                messages.append({"role": "user", "content": "Execution declined. Suggest another approach or conclude."})
-                break
+            print(f"{CYAN}--- Command Output ---{RESET}\n{output_str.strip()}\n{CYAN}----------------------{RESET}")
+            messages.append({
+                "role": "user", 
+                "content": f"Command output:\n{output_str}\nIf task is finished, summarize and complete your turn without bash blocks."
+            })
+        else:
+            print(f"{YELLOW}Action cancelled by user.{RESET}")
+            messages.append({"role": "user", "content": "Action cancelled by user. Do not propose further commands."})
+            break
 
 def login(api_key):
     with open(TOKEN_FILE, "w") as f: f.write(api_key)
