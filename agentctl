@@ -53,7 +53,7 @@ def process_llm_turn(messages):
     while True:
         print(f"{MAGENTA}{BOLD}AgentCTL:{RESET} ", end="", flush=True)
         payload = {
-            "model": "llama3",
+            "model": "qwen",
             "messages": messages,
             "stream": True,
             "max_tokens": 4096,
