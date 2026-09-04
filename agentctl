@@ -5,6 +5,7 @@ API_GATEWAY = "http://localhost:30080"
 VLLM_DIRECT = "http://localhost:30800/v1"
 TOKEN_FILE = os.path.expanduser("~/.agentic_token")
 
+# ANSI Color Constants
 CYAN = '\033[96m'
 GREEN = '\033[92m'
 YELLOW = '\033[93m'
@@ -13,17 +14,24 @@ MAGENTA = '\033[95m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 
-SYSTEM_PROMPT = """You are AgentCTL, an enterprise CLI assistant running locally on K3s.
-Your job is to assist the user by directly creating files, modifying code, inspecting system state, and executing commands.
+SYSTEM_PROMPT_TEMPLATE = """You are AgentCTL, an enterprise AI coding agent running locally in the terminal.
+You have direct access to inspect, refactor, edit, and manage code in the user's workspace.
 
-STRICT OPERATIONAL RULES:
-1. To write or create files, use standard heredocs in a single bash block, e.g.:
-cat << 'EOF' > filename.py
-# code here
+CURRENT WORKSPACE:
+Path: {cwd}
+
+DIRECTORY STRUCTURE & GIT CONTEXT:
+{folder_context}
+
+OPERATIONAL RULES:
+1. When asked to inspect, write, or refactor code, operate directly on files relative to the current path.
+2. To write or edit files, output clean heredocs in a single bash block:
+cat << 'EOF' > filename.ext
+# updated code
 EOF
-2. Provide EXACTLY ONE ```bash block per response turn when an action is required.
-3. NEVER simulate or hallucinate terminal output, stdout, or stderr inside markdown blocks.
-4. Once an action is executed successfully or a task is complete, summarize the outcome in plain text WITHOUT any further ```bash blocks.
+3. Provide EXACTLY ONE ```bash block per turn when proposing terminal actions or file changes.
+4. NEVER simulate or hallucinate stdout/stderr inside markdown.
+5. Once a refactor or file edit is applied, summarize the changes and end your turn without further ```bash blocks.
 """
 
 def get_token():
@@ -33,34 +41,79 @@ def get_token():
     with open(TOKEN_FILE, "r") as f:
         return f.read().strip()
 
-def chat_repl():
-    print(f"{CYAN}{BOLD}╭──────────────────────────────────────────────────────────╮{RESET}")
-    print(f"{CYAN}{BOLD}│  AgentCTL Interactive Workspace (Claude-Code Style)      │{RESET}")
-    print(f"{CYAN}{BOLD}╰──────────────────────────────────────────────────────────╯{RESET}")
-    print(f"{YELLOW}Type '/exit' to quit, '/clear' to reset context.{RESET}\n")
+def inspect_workspace():
+    """Gathers directory files and git status from current working directory."""
+    cwd = os.getcwd()
+    ignored = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.idea', '.vscode', 'dist', 'build'}
+    file_list = []
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for root, dirs, files in os.walk(cwd):
+        dirs[:] = [d for d in dirs if d not in ignored]
+        rel_root = os.path.relpath(root, cwd)
+        prefix = "" if rel_root == "." else rel_root + "/"
+        for f in files:
+            if len(file_list) < 40:
+                file_list.append(prefix + f)
+            else:
+                break
+        if len(file_list) >= 40:
+            file_list.append("... (additional files truncated)")
+            break
+
+    context_str = "\n".join(f"- {f}" for f in file_list) if file_list else "Directory is empty."
+
+    # Git branch / status check
+    try:
+        git_res = subprocess.run("git status --short -b", shell=True, text=True, capture_output=True, cwd=cwd)
+        if git_res.returncode == 0 and git_res.stdout.strip():
+            context_str += f"\n\nGit Status:\n{git_res.stdout.strip()}"
+    except Exception:
+        pass
+
+    return cwd, context_str
+
+def chat_repl():
+    cwd, folder_context = inspect_workspace()
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(cwd=cwd, folder_context=folder_context)
+
+    print(f"{CYAN}{BOLD}╭──────────────────────────────────────────────────────────╮{RESET}")
+    print(f"{CYAN}{BOLD}│  AgentCTL Workspace Assistant (Claude-Code Style)        │{RESET}")
+    print(f"{CYAN}{BOLD}╰──────────────────────────────────────────────────────────╯{RESET}")
+    print(f"{MAGENTA}📂 Active Directory:{RESET} {BOLD}{cwd}{RESET}")
+    print(f"{YELLOW}Type '/exit' to quit, '/clear' to reset, '/refresh' to re-scan files.{RESET}\n")
+
+    messages = [{"role": "system", "content": system_prompt}]
 
     while True:
         try:
-            user_input = input(f"\n{GREEN}{BOLD}❯ You:{RESET} ")
+            user_input = input(f"{GREEN}{BOLD}❯ You:{RESET} ")
             if not user_input.strip(): continue
             if user_input.lower() in ['/exit', 'exit', 'quit']: break
+            
             if user_input.lower() in ['/clear', 'clear']:
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-                print(f"{YELLOW}Context cleared.{RESET}")
+                cwd, folder_context = inspect_workspace()
+                system_prompt = SYSTEM_PROMPT_TEMPLATE.format(cwd=cwd, folder_context=folder_context)
+                messages = [{"role": "system", "content": system_prompt}]
+                print(f"{YELLOW}Context reset to initial folder state.{RESET}\n")
+                continue
+
+            if user_input.lower() in ['/refresh', 'refresh']:
+                cwd, folder_context = inspect_workspace()
+                system_prompt = SYSTEM_PROMPT_TEMPLATE.format(cwd=cwd, folder_context=folder_context)
+                messages[0] = {"role": "system", "content": system_prompt}
+                print(f"{YELLOW}Workspace context refreshed.{RESET}\n")
                 continue
 
             messages.append({"role": "user", "content": user_input})
-            process_llm_turn(messages)
+            process_llm_turn(messages, cwd)
 
         except (KeyboardInterrupt, EOFError):
             print(f"\n{YELLOW}Session ended.{RESET}")
             break
 
-def process_llm_turn(messages):
+def process_llm_turn(messages, cwd):
     while True:
-        print(f"{MAGENTA}{BOLD}AgentCTL:{RESET} ", end="", flush=True)
+        print(f"\n{MAGENTA}{BOLD}AgentCTL:{RESET} ", end="", flush=True)
         payload = {
             "model": "qwen",
             "messages": messages,
@@ -102,22 +155,22 @@ def process_llm_turn(messages):
             
         print(f"\n{YELLOW}⚙️  Action Proposed:{RESET}")
         print(f"{CYAN}{script}{RESET}")
-        confirm = input(f"{YELLOW}Execute command? [Y/n]: {RESET}").strip().lower()
+        confirm = input(f"{YELLOW}Execute in {cwd}? [Y/n]: {RESET}").strip().lower()
         
         if confirm in ['', 'y', 'yes']:
-            result = subprocess.run(script, shell=True, text=True, capture_output=True)
+            result = subprocess.run(script, shell=True, text=True, capture_output=True, cwd=cwd)
             output_str = ""
             if result.stdout: output_str += f"STDOUT:\n{result.stdout}\n"
             if result.stderr: output_str += f"STDERR:\n{result.stderr}\n"
             if not output_str: output_str = "Executed successfully with no stdout/stderr."
             
-            print(f"{CYAN}--- Command Output ---{RESET}\n{output_str.strip()}\n{CYAN}----------------------{RESET}")
+            print(f"{CYAN}--- Command Output ---{RESET}\n{output_str.strip()}\n{CYAN}----------------------{RESET}\n")
             messages.append({
                 "role": "user", 
-                "content": f"Command output:\n{output_str}\nIf task is finished, summarize and complete your turn without bash blocks."
+                "content": f"Command output:\n{output_str}\nIf the task is finished, summarize changes and stop proposing bash commands."
             })
         else:
-            print(f"{YELLOW}Action cancelled by user.{RESET}")
+            print(f"{YELLOW}Action cancelled by user.{RESET}\n")
             messages.append({"role": "user", "content": "Action cancelled by user. Do not propose further commands."})
             break
 
