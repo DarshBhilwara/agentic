@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+import argparse, requests, time, os, sys, json, subprocess, re
+
+API_GATEWAY = "http://localhost:30080"
+VLLM_DIRECT = "http://localhost:30800/v1"
+TOKEN_FILE = os.path.expanduser("~/.agentic_token")
+
+CYAN = '\033[96m'
+GREEN = '\033[92m'
+YELLOW = '\033[93m'
+RED = '\033[91m'
+MAGENTA = '\033[95m'
+RESET = '\033[0m'
+BOLD = '\033[1m'
+
+SYSTEM_PROMPT = """You are AgentCTL, an enterprise agentic CLI running locally on K3s.
+When asked to perform tasks on the local system or inspect files, output the shell command inside a ```bash block.
+The CLI will execute it with user permission and feed the terminal output back to you automatically."""
+
+def get_token():
+    if not os.path.exists(TOKEN_FILE):
+        print(f"{RED}Error: Unauthenticated. Run 'agentctl login <token>' first.{RESET}")
+        sys.exit(1)
+    with open(TOKEN_FILE, "r") as f:
+        return f.read().strip()
+
+def chat_repl():
+    print(f"{CYAN}{BOLD}╭──────────────────────────────────────────────────────────╮{RESET}")
+    print(f"{CYAN}{BOLD}│  AgentCTL Interactive Workspace (Claude-Code Style)      │{RESET}")
+    print(f"{CYAN}{BOLD}╰──────────────────────────────────────────────────────────╯{RESET}")
+    print(f"{YELLOW}Type '/exit' to quit, '/clear' to reset context.{RESET}\n")
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    while True:
+        try:
+            user_input = input(f"\n{GREEN}{BOLD}❯ You:{RESET} ")
+            if not user_input.strip(): continue
+            if user_input.lower() in ['/exit', 'exit', 'quit']: break
+            if user_input.lower() in ['/clear', 'clear']:
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                print(f"{YELLOW}Context cleared.{RESET}")
+                continue
+
+            messages.append({"role": "user", "content": user_input})
+            process_llm_turn(messages)
+
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{YELLOW}Session ended.{RESET}")
+            break
+
+def process_llm_turn(messages):
+    while True:
+        print(f"{MAGENTA}{BOLD}AgentCTL:{RESET} ", end="", flush=True)
+        payload = {
+            "model": "llama3",
+            "messages": messages,
+            "stream": True,
+            "max_tokens": 4096,
+            "temperature": 0.2
+        }
+
+        try:
+            response = requests.post(f"{VLLM_DIRECT}/chat/completions", json=payload, stream=True)
+        except requests.exceptions.ConnectionError:
+            print(f"{RED}\nError: vLLM service unavailable at {VLLM_DIRECT}. Check container status.{RESET}")
+            return
+
+        full_response = ""
+        for line in response.iter_lines():
+            if line:
+                decoded = line.decode('utf-8')
+                if decoded.startswith("data: ") and decoded != "data: [DONE]":
+                    try:
+                        chunk = json.loads(decoded[6:])
+                        content = chunk['choices'][0]['delta'].get('content', '')
+                        full_response += content
+                        sys.stdout.write(content)
+                        sys.stdout.flush()
+                    except json.JSONDecodeError:
+                        pass
+        
+        print()
+        messages.append({"role": "assistant", "content": full_response})
+
+        bash_blocks = re.findall(r'```bash\n(.*?)\n```', full_response, re.DOTALL)
+        if not bash_blocks:
+            break
+
+        for script in bash_blocks:
+            script = script.strip()
+            if not script: continue
+            
+            print(f"\n{YELLOW}⚙️  Action Proposed:{RESET}")
+            print(f"{CYAN}{script}{RESET}")
+            confirm = input(f"{YELLOW}Execute command? [Y/n]: {RESET}").strip().lower()
+            
+            if confirm in ['', 'y', 'yes']:
+                result = subprocess.run(script, shell=True, text=True, capture_output=True)
+                output_str = ""
+                if result.stdout: output_str += f"STDOUT:\n{result.stdout}\n"
+                if result.stderr: output_str += f"STDERR:\n{result.stderr}\n"
+                if not output_str: output_str = "Executed successfully with no stdout/stderr."
+                
+                print(f"{CYAN}--- Command Output ---{RESET}\n{output_str.strip()}\n{CYAN}----------------------{RESET}")
+                messages.append({
+                    "role": "user", 
+                    "content": f"Command output:\n{output_str}\nProceed with the task."
+                })
+                break 
+            else:
+                messages.append({"role": "user", "content": "Execution declined. Suggest another approach or conclude."})
+                break
+
+def login(api_key):
+    with open(TOKEN_FILE, "w") as f: f.write(api_key)
+    print(f"{GREEN}Authenticated successfully.{RESET}")
+
+def submit_background(prompt, watch):
+    token = get_token()
+    res = requests.post(f"{API_GATEWAY}/tasks", params={"prompt": prompt}, headers={"X-API-Key": token})
+    if res.status_code != 200:
+        print(f"{RED}Server Error: {res.text}{RESET}")
+        return
+    
+    task_id = res.json()["task_id"]
+    print(f"{GREEN}Task queued in background. Task ID: {task_id}{RESET}")
+
+    if watch:
+        print(f"{YELLOW}Streaming status...{RESET}\n")
+        while True:
+            status_res = requests.get(f"{API_GATEWAY}/tasks/{task_id}", headers={"X-API-Key": token})
+            data = status_res.json()
+            sys.stdout.write(f"\rStatus: [{data['status'].upper()}]")
+            sys.stdout.flush()
+            
+            if data['status'] == 'completed':
+                print(f"\n\n{CYAN}--- Output ---{RESET}\n{data['result']}")
+                break
+            elif data['status'] == 'failed':
+                print(f"\n\n{RED}--- Error ---{RESET}\n{data.get('error', 'Unknown error')}")
+                break
+            time.sleep(2)
+
+def list_tasks():
+    token = get_token()
+    res = requests.get(f"{API_GATEWAY}/tasks", headers={"X-API-Key": token})
+    if res.status_code != 200:
+        print(f"{RED}Server Error: {res.text}{RESET}")
+        return
+    print(f"{CYAN}{'TASK ID':<40} | {'STATUS'}{RESET}")
+    print("-" * 60)
+    for t in res.json():
+        print(f"{t['id']:<40} | {t['status'].upper()}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Agentic CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    p_login = subparsers.add_parser("login", help="Authenticate with token")
+    p_login.add_argument("token", help="Corporate API token")
+
+    p_submit = subparsers.add_parser("submit", help="Submit background task")
+    p_submit.add_argument("prompt", help="Task prompt or URL")
+    p_submit.add_argument("-w", "--watch", action="store_true", help="Watch until complete")
+
+    p_list = subparsers.add_parser("list", help="List submitted tasks")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        chat_repl()
+    elif args.command == "login":
+        login(args.token)
+    elif args.command == "submit":
+        submit_background(args.prompt, args.watch)
+    elif args.command == "list":
+        list_tasks()

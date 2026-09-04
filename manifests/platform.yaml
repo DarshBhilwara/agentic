@@ -1,0 +1,283 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agentic-ai
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: agentic-workspace-pv
+spec:
+  capacity:
+    storage: 100Gi
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /home/iiitd/Documents/agentic/workspace
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: Exists
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agentic-workspace-pvc
+  namespace: agentic-ai
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: local-storage
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+    spec:
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - image: nvcr.io/nvidia/k8s-device-plugin:v0.14.3
+        name: nvidia-device-plugin-ctr
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: device-plugin
+          mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+      - name: device-plugin
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-inference
+  namespace: agentic-ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        - --model
+        - meta-llama/Meta-Llama-3.1-8B-Instruct
+        - --served-model-name
+        - llama3
+        - --port
+        - "8000"
+        - --gpu-memory-utilization
+        - "0.9"
+        env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          value: "HUGGINGFACE_TOKEN"
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: model-cache
+          mountPath: /root/.cache/huggingface
+      volumes:
+      - name: model-cache
+        hostPath:
+          path: /home/iiitd/Documents/agentic/model-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  namespace: agentic-ai
+spec:
+  type: NodePort
+  selector:
+    app: vllm
+  ports:
+  - port: 8000
+    targetPort: 8000
+    nodePort: 30800
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-queue
+  namespace: agentic-ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: agentic-ai
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: agentic-ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+      - name: gateway
+        image: python:3.11-slim
+        command: ["sh", "-c", "pip install fastapi uvicorn redis && uvicorn gateway:app --host 0.0.0.0 --port 8000"]
+        workingDir: /app
+        volumeMounts:
+        - name: code
+          mountPath: /app
+      volumes:
+      - name: code
+        hostPath:
+          path: /home/iiitd/Documents/agentic/code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: agentic-ai
+spec:
+  type: NodePort
+  selector:
+    app: gateway
+  ports:
+  - port: 8000
+    targetPort: 8000
+    nodePort: 30080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-worker
+  namespace: agentic-ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      initContainers:
+      - name: workspace-init
+        image: busybox
+        command: 
+        - sh
+        - -c
+        - "mkdir -p /workspace/incoming /workspace/processed /workspace/users && chmod -R 777 /workspace"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      containers:
+      - name: worker
+        image: python:3.11-slim
+        command: ["sh", "-c", "pip install redis beautifulsoup4 requests openai && python worker.py"]
+        workingDir: /app
+        volumeMounts:
+        - name: code
+          mountPath: /app
+        - name: workspace
+          mountPath: /workspace
+      volumes:
+      - name: code
+        hostPath:
+          path: /home/iiitd/Documents/agentic/code
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: agentic-workspace-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: folder-watchdog
+  namespace: agentic-ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: watchdog
+  template:
+    metadata:
+      labels:
+        app: watchdog
+    spec:
+      containers:
+      - name: watchdog
+        image: python:3.11-slim
+        command: ["sh", "-c", "pip install watchdog requests && python watchdog_daemon.py"]
+        workingDir: /app
+        volumeMounts:
+        - name: code
+          mountPath: /app
+        - name: workspace
+          mountPath: /workspace
+      volumes:
+      - name: code
+        hostPath:
+          path: /home/iiitd/Documents/agentic/code
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: agentic-workspace-pvc
