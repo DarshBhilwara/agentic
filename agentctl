@@ -36,10 +36,8 @@ except ImportError:
 API_GATEWAY = os.getenv("AGENTCTL_GATEWAY_URL", "http://localhost:30080")
 VLLM_DIRECT = os.getenv("AGENTCTL_VLLM_URL", "http://localhost:30800/v1")
 
-# Support specific Trace/Metric endpoints, fallback to general endpoint
-OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-OTEL_TRACES_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-OTEL_METRICS_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+OTEL_TRACES_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:30006/v1/traces")
+OTEL_METRICS_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://localhost:30090/api/v1/otlp/v1/metrics")
 
 MODEL_NAME = os.getenv("AGENTCTL_MODEL_NAME", "qwen")
 TOKEN_FILE = os.path.expanduser("~/.agentic_token")
@@ -268,11 +266,7 @@ def init_telemetry():
 
     tracer_provider = TracerProvider(resource=resource)
     
-    # Configure Trace Exporter
     trace_url = OTEL_TRACES_ENDPOINT
-    if not trace_url and OTEL_ENDPOINT:
-        trace_url = f"{OTEL_ENDPOINT.rstrip('/')}/v1/traces"
-        
     if trace_url:
         span_exporter = OTLPSpanExporter(endpoint=trace_url)
         tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
@@ -280,11 +274,7 @@ def init_telemetry():
     trace.set_tracer_provider(tracer_provider)
     tracer = trace.get_tracer("agentctl", "0.1")
 
-    # Configure Metric Exporter
     metric_url = OTEL_METRICS_ENDPOINT
-    if not metric_url and OTEL_ENDPOINT:
-        metric_url = f"{OTEL_ENDPOINT.rstrip('/')}/v1/metrics"
-
     if metric_url:
         metric_exporter = OTLPMetricExporter(endpoint=metric_url)
         reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=10000)
@@ -366,8 +356,8 @@ def _run_chat_repl(session_span):
         print(f"{YELLOW}   (web_search disabled — set SERPER_API_KEY to enable Serper search){RESET}")
     
     if OTEL_AVAILABLE:
-        t_url = OTEL_TRACES_ENDPOINT or (f"{OTEL_ENDPOINT.rstrip('/')}/v1/traces" if OTEL_ENDPOINT else "Disabled")
-        m_url = OTEL_METRICS_ENDPOINT or (f"{OTEL_ENDPOINT.rstrip('/')}/v1/metrics" if OTEL_ENDPOINT else "Disabled")
+        t_url = OTEL_TRACES_ENDPOINT or "Disabled"
+        m_url = OTEL_METRICS_ENDPOINT or "Disabled"
         print(f"{CYAN}📡 Telemetry (OTel):{RESET} Active")
         print(f"{CYAN}   ├─ Traces: {RESET} {t_url}")
         print(f"{CYAN}   └─ Metrics:{RESET} {m_url}")
