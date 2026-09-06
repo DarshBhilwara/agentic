@@ -2,11 +2,10 @@
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -15,15 +14,16 @@ tracer = None
 meter = None
 llm_token_counter = None
 cmd_exec_counter = None
+tool_call_counter = None
 llm_latency_histogram = None
 
 try:
     from opentelemetry import trace, metrics
     from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.metrics import MeterProvider
-    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader, ConsoleMetricExporter
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
     from opentelemetry.instrumentation.requests import RequestsInstrumentor
@@ -36,6 +36,7 @@ except ImportError:
 API_GATEWAY = os.getenv("AGENTCTL_GATEWAY_URL", "http://localhost:30080")
 VLLM_DIRECT = os.getenv("AGENTCTL_VLLM_URL", "http://localhost:30800/v1")
 OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:6006")
+MODEL_NAME = os.getenv("AGENTCTL_MODEL_NAME", "qwen")
 TOKEN_FILE = os.path.expanduser("~/.agentic_token")
 
 CYAN = '\033[96m'
@@ -46,8 +47,8 @@ MAGENTA = '\033[95m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 
-SYSTEM_PROMPT_TEMPLATE = """You are AgentCTL, an enterprise AI coding agent running locally in the terminal.
-You have direct access to inspect, refactor, edit, and manage code in the user's workspace.
+SYSTEM_PROMPT_TEMPLATE = """You are AgentCTL, a general-purpose enterprise AI agent running locally in the terminal.
+You are not limited to coding - you help with research, information lookup, file and workspace management, and general task execution, using the tools made available to you.
 
 CURRENT WORKSPACE:
 Path: {cwd}
@@ -55,23 +56,209 @@ Path: {cwd}
 DIRECTORY STRUCTURE & GIT CONTEXT:
 {folder_context}
 
+AVAILABLE TOOLS:
+- execute_command: run a shell command in the workspace and read back its stdout/stderr (requires user confirmation)
+- read_file: read the contents of a file in the workspace
+- write_file: create or overwrite a file in the workspace (requires user confirmation)
+- list_directory: list the contents of a directory
+- web_search: search Google via Serper for current information, docs, or research
+
 OPERATIONAL RULES:
-1. When asked to inspect, write, or refactor code, operate directly on files relative to the current path.
-2. To write or edit files, output clean heredocs in a single bash block.
-3. Provide EXACTLY ONE ```bash block per turn when proposing terminal actions or file changes.
-4. NEVER simulate or hallucinate stdout/stderr inside markdown.
-5. Once a refactor or file edit is applied, summarize the changes and end your turn without further ```bash blocks.
+1. Use a tool whenever you need information or an effect you don't already have - never guess at file contents, command output, or facts that a tool could confirm.
+2. Call tools one at a time and read each result before deciding your next step.
+3. NEVER fabricate or assume the output of a tool call.
+4. Prefer read-only tools (read_file, list_directory, web_search) over execute_command when they can get you the same information with less risk.
+5. Once the task is done, stop calling tools and give the user a clear, plain-language summary of what you found or changed.
 """
 
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_command",
+            "description": "Execute a shell command in the current fworkspace directory and return its stdout/stderr/exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to run."}
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the text contents of a file, relative to the current workspace unless an absolute path is given.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read."}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a file with the given text content, relative to the current workspace unless an absolute path is given.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write."},
+                    "content": {"type": "string", "description": "Full text content to write into the file."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and subdirectories inside a directory, relative to the current workspace unless an absolute path is given.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory to list. Defaults to workspace root.", "default": "."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search Google via Serper API for real-time information, documentation, and web data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."},
+                    "max_results": {"type": "integer", "description": "Maximum number of results to return.", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+CONFIRM_REQUIRED_TOOLS = {"execute_command", "write_file"}
+
+
+def tool_execute_command(args: Dict, cwd: str) -> str:
+    command = (args or {}).get("command", "")
+    if not command:
+        return "Error: no command provided."
+    result = subprocess.run(command, shell=True, text=True, capture_output=True, cwd=cwd)
+    output_str = f"STDOUT:\n{result.stdout}\n" if result.stdout else ""
+    output_str += f"STDERR:\n{result.stderr}\n" if result.stderr else ""
+    if not output_str:
+        output_str = "Executed successfully with no stdout/stderr.\n"
+    output_str += f"Exit code: {result.returncode}"
+    return output_str
+
+
+def tool_read_file(args: Dict, cwd: str) -> str:
+    path = (args or {}).get("path", "")
+    if not path:
+        return "Error: no path provided."
+    full_path = path if os.path.isabs(path) else os.path.join(cwd, path)
+    try:
+        with open(full_path, "r", errors="replace") as f:
+            content = f.read()
+        if len(content) > 20000:
+            content = content[:20000] + "\n... (truncated)"
+        return content if content else "(file is empty)"
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+
+def tool_write_file(args: Dict, cwd: str) -> str:
+    path = (args or {}).get("path", "")
+    content = (args or {}).get("content", "")
+    if not path:
+        return "Error: no path provided."
+    full_path = path if os.path.isabs(path) else os.path.join(cwd, path)
+    try:
+        parent = os.path.dirname(full_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(full_path, "w") as f:
+            f.write(content)
+        return f"Wrote {len(content)} bytes to {full_path}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+
+def tool_list_directory(args: Dict, cwd: str) -> str:
+    path = (args or {}).get("path", ".") or "."
+    full_path = path if os.path.isabs(path) else os.path.join(cwd, path)
+    try:
+        entries = sorted(os.listdir(full_path))
+        return "\n".join(entries) if entries else "(empty directory)"
+    except Exception as e:
+        return f"Error listing directory: {e}"
+
+
+def tool_web_search(args: Dict, cwd: str) -> str:
+    query = (args or {}).get("query", "")
+    max_results = (args or {}).get("max_results", 5)
+    if not query:
+        return "Error: no query provided."
+
+    api_key = os.getenv("SERPER_API_KEY")
+    if not api_key:
+        return (
+            "Error: web_search is not configured. Set SERPER_API_KEY environment variable "
+        )
+
+    try:
+        headers = {
+            "X-API-KEY": api_key,
+            "Content-Type": "application/json"
+        }
+        res = requests.post(
+            "https://google.serper.dev/search",
+            headers=headers,
+            json={"q": query, "num": max_results},
+            timeout=15,
+        )
+        res.raise_for_status()
+        data = res.json()
+        organic = data.get("organic", [])
+        if not organic:
+            return "No search results found."
+
+        lines = []
+        for r in organic[:max_results]:
+            snippet = (r.get("snippet") or "")[:300]
+            lines.append(f"- {r.get('title')} ({r.get('link')})\n  {snippet}")
+        return "\n".join(lines)
+    except requests.exceptions.RequestException as e:
+        return f"Error performing Serper web search: {e}"
+
+
+TOOL_IMPLEMENTATIONS = {
+    "execute_command": tool_execute_command,
+    "read_file": tool_read_file,
+    "write_file": tool_write_file,
+    "list_directory": tool_list_directory,
+    "web_search": tool_web_search,
+}
+
+
 def init_telemetry():
-    global tracer, meter, llm_token_counter, cmd_exec_counter, llm_latency_histogram
+    global tracer, meter, llm_token_counter, cmd_exec_counter, tool_call_counter, llm_latency_histogram
     if not OTEL_AVAILABLE:
         return
 
     resource = Resource.create({
         SERVICE_NAME: "agentctl-cli",
-        SERVICE_VERSION: "2.0.0",
-        "deployment.environment": os.getenv("ENVIRONMENT", "local-cli")
+        SERVICE_VERSION: "0.1", "deployment.environment": os.getenv("ENVIRONMENT", "local-cli")
     })
 
     tracer_provider = TracerProvider(resource=resource)
@@ -79,9 +266,9 @@ def init_telemetry():
         span_url = f"{OTEL_ENDPOINT.rstrip('/')}/v1/traces"
         span_exporter = OTLPSpanExporter(endpoint=span_url)
         tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
-    
+
     trace.set_tracer_provider(tracer_provider)
-    tracer = trace.get_tracer("agentctl", "2.0.0")
+    tracer = trace.get_tracer("agentctl", "0.1")
 
     if OTEL_ENDPOINT:
         metric_url = f"{OTEL_ENDPOINT.rstrip('/')}/v1/metrics"
@@ -90,10 +277,11 @@ def init_telemetry():
         meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
         metrics.set_meter_provider(meter_provider)
 
-    meter = metrics.get_meter("agentctl", "2.0.0")
+    meter = metrics.get_meter("agentctl", "0.1")
 
     llm_token_counter = meter.create_counter("agentctl.llm.tokens.total", description="Total tokens generated")
-    cmd_exec_counter = meter.create_counter("agentctl.commands.executed.total", description="Total bash commands")
+    cmd_exec_counter = meter.create_counter("agentctl.commands.executed.total", description="Total shell commands executed")
+    tool_call_counter = meter.create_counter("agentctl.tools.invoked.total", description="Total tool calls invoked")
     llm_latency_histogram = meter.create_histogram("agentctl.llm.latency.seconds", description="LLM response latency")
 
     RequestsInstrumentor().instrument()
@@ -158,7 +346,10 @@ def _run_chat_repl(session_span):
     print(f"{CYAN}{BOLD}│  AgentCTL  │{RESET}")
     print(f"{CYAN}{BOLD}╰────────────╯{RESET}")
     print(f"{MAGENTA}📂 Directory:{RESET} {BOLD}{cwd}{RESET}")
-    print(f"{MAGENTA}🔌 Target vLLM:{RESET} {VLLM_DIRECT}")
+    print(f"{MAGENTA}🔌 Target vLLM:{RESET} {VLLM_DIRECT} ({MODEL_NAME})")
+    print(f"{MAGENTA}🔧 Tools:{RESET} " + ", ".join(TOOL_IMPLEMENTATIONS.keys()))
+    if not os.getenv("SERPER_API_KEY"):
+        print(f"{YELLOW}   (web_search disabled — set SERPER_API_KEY to enable Serper search){RESET}")
     if OTEL_AVAILABLE:
         print(f"{CYAN}📡 Telemetry (OTel):{RESET} Active ({OTEL_ENDPOINT})")
     print(f"{YELLOW}Type '/exit' to quit, '/clear' to reset, '/refresh' to re-scan files.{RESET}\n")
@@ -188,26 +379,33 @@ def _run_chat_repl(session_span):
             print(f"\n{YELLOW}Session ended.{RESET}")
             break
 
-def process_llm_turn(messages: List[Dict[str, str]], cwd: str):
+def process_llm_turn(messages: List[Dict], cwd: str):
     if tracer:
         with tracer.start_as_current_span("process_llm_turn") as span:
             _do_process_llm_turn(messages, cwd, span)
     else:
         _do_process_llm_turn(messages, cwd, None)
 
-def _do_process_llm_turn(messages: List[Dict[str, str]], cwd: str, span):
-    start_time = time.time()
+def _do_process_llm_turn(messages: List[Dict], cwd: str, span):
     while True:
         print(f"\n{MAGENTA}{BOLD}AgentCTL:{RESET} ", end="", flush=True)
-        payload = {"model": "qwen", "messages": messages, "stream": True, "max_tokens": 4096, "temperature": 0.1}
+        payload = {
+            "model": MODEL_NAME,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": 4096,
+            "temperature": 0.1,
+            "tools": TOOLS_SCHEMA,
+            "tool_choice": "auto",
+        }
         turn_span = tracer.start_span("vllm_stream_request") if tracer else None
+        start_time = time.time()
 
         try:
-            response = requests.post(f"{VLLM_DIRECT}/chat/completions", json=payload, stream=True, timeout=10)
+            response = requests.post(f"{VLLM_DIRECT}/chat/completions", json=payload, stream=True, timeout=30)
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
             print(f"{RED}\nConnection Error: Unable to reach vLLM at {VLLM_DIRECT}{RESET}")
-            print(f"{RED}Ensure your server is running or configure AGENTCTL_VLLM_URL.{RESET}")
             if turn_span:
                 turn_span.set_status(Status(StatusCode.ERROR, str(e)))
                 turn_span.end()
@@ -215,65 +413,111 @@ def _do_process_llm_turn(messages: List[Dict[str, str]], cwd: str, span):
 
         full_response = ""
         token_count = 0
+        tool_calls_accum: Dict[int, Dict[str, str]] = {}
 
         for line in response.iter_lines():
-            if line:
-                decoded = line.decode('utf-8')
-                if decoded.startswith("data: ") and decoded != "data: [DONE]":
-                    try:
-                        chunk = json.loads(decoded[6:])
-                        content = chunk['choices'][0]['delta'].get('content', '')
-                        full_response += content
-                        token_count += 1
-                        sys.stdout.write(content)
-                        sys.stdout.flush()
-                    except json.JSONDecodeError:
-                        pass
+            if not line: continue
+            decoded = line.decode('utf-8')
+            if not decoded.startswith("data: ") or decoded == "data: [DONE]": continue
+            try:
+                chunk = json.loads(decoded[6:])
+            except json.JSONDecodeError: continue
+
+            choice = chunk.get("choices", [{}])[0]
+            delta = choice.get("delta", {})
+
+            content = delta.get("content")
+            if content:
+                full_response += content
+                token_count += 1
+                sys.stdout.write(content)
+                sys.stdout.flush()
+
+            for tc_delta in (delta.get("tool_calls") or []):
+                idx = tc_delta.get("index", 0)
+                slot = tool_calls_accum.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc_delta.get("id"): slot["id"] = tc_delta["id"]
+                fn_delta = tc_delta.get("function") or {}
+                if fn_delta.get("name"): slot["name"] += fn_delta["name"]
+                if fn_delta.get("arguments"): slot["arguments"] += fn_delta["arguments"]
         print()
-        messages.append({"role": "assistant", "content": full_response})
 
         duration = time.time() - start_time
-        if llm_token_counter: llm_token_counter.add(token_count, {"model": "qwen"})
-        if llm_latency_histogram: llm_latency_histogram.record(duration, {"model": "qwen"})
+        if llm_token_counter: llm_token_counter.add(token_count, {"model": MODEL_NAME})
+        if llm_latency_histogram: llm_latency_histogram.record(duration, {"model": MODEL_NAME})
         if turn_span:
             turn_span.set_attribute("llm.tokens_received", token_count)
             turn_span.set_attribute("llm.duration_seconds", duration)
+            turn_span.set_attribute("llm.tool_calls_requested", len(tool_calls_accum))
             turn_span.end()
 
-        bash_blocks = re.findall(r'```bash\n(.*?)\n```', full_response, re.DOTALL)
-        if not bash_blocks: break
-
-        script = bash_blocks[0].strip()
-        if not script: break
-
-        print(f"\n{YELLOW}⚙️  Action Proposed:{RESET}\n{CYAN}{script}{RESET}")
-        confirm = input(f"{YELLOW}Execute in {cwd}? [Y/n]: {RESET}").strip().lower()
-
-        if confirm in ['', 'y', 'yes']: execute_command(script, cwd, messages)
-        else:
-            print(f"{YELLOW}Action cancelled.{RESET}\n")
-            messages.append({"role": "user", "content": "Action cancelled. Do not propose further commands."})
+        if not tool_calls_accum:
+            messages.append({"role": "assistant", "content": full_response})
             break
 
-def execute_command(script: str, cwd: str, messages: List[Dict[str, str]]):
-    cmd_span = tracer.start_span("execute_bash_command") if tracer else None
-    if cmd_span:
-        cmd_span.set_attribute("cmd.script", script)
-        cmd_span.set_attribute("cmd.cwd", cwd)
-    if cmd_exec_counter: cmd_exec_counter.add(1)
+        tool_calls_list = []
+        for i in sorted(tool_calls_accum.keys()):
+            slot = tool_calls_accum[i]
+            tool_calls_list.append({
+                "id": slot["id"] or f"call_{i}",
+                "type": "function",
+                "function": {"name": slot["name"], "arguments": slot["arguments"] or "{}"},
+            })
 
-    result = subprocess.run(script, shell=True, text=True, capture_output=True, cwd=cwd)
-    output_str = f"STDOUT:\n{result.stdout}\n" if result.stdout else ""
-    output_str += f"STDERR:\n{result.stderr}\n" if result.stderr else ""
-    if not output_str: output_str = "Executed successfully with no stdout/stderr."
+        messages.append({
+            "role": "assistant",
+            "content": full_response or None,
+            "tool_calls": tool_calls_list,
+        })
 
-    if cmd_span:
-        cmd_span.set_attribute("cmd.exit_code", result.returncode)
-        if result.returncode != 0: cmd_span.set_status(Status(StatusCode.ERROR, f"Exit Code {result.returncode}"))
-        cmd_span.end()
+        for tc in tool_calls_list:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except json.JSONDecodeError:
+                args = {}
+            result, cancelled = dispatch_tool_call(name, args, cwd)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": name,
+                "content": result,
+            })
+            if cancelled:
+                messages.append({
+                    "role": "user",
+                    "content": "Action was declined. Do not retry it; adjust your plan or ask how to proceed.",
+                })
 
-    print(f"{CYAN}--- Output ---{RESET}\n{output_str.strip()}\n{CYAN}--------------{RESET}\n")
-    messages.append({"role": "user", "content": f"Command output:\n{output_str}\nIf finished, summarize and stop."})
+def dispatch_tool_call(name: str, args: Dict, cwd: str) -> Tuple[str, bool]:
+    impl = TOOL_IMPLEMENTATIONS.get(name)
+    if impl is None:
+        return f"Error: unknown tool '{name}'.", False
+
+    if name in CONFIRM_REQUIRED_TOOLS:
+        print(f"\n{YELLOW}⚙️  Tool call proposed:{RESET} {BOLD}{name}{RESET}")
+        print(f"{CYAN}{json.dumps(args, indent=2)}{RESET}")
+        confirm = input(f"{YELLOW}Allow action in {cwd}? [Y/n]: {RESET}").strip().lower()
+        if confirm not in ['', 'y', 'yes']:
+            print(f"{YELLOW}Action cancelled.{RESET}\n")
+            return "User declined to run this action.", True
+    else:
+        print(f"\n{YELLOW}🔧 Calling tool:{RESET} {name}({json.dumps(args)})")
+
+    if tracer:
+        with tracer.start_as_current_span(f"tool.{name}") as sp:
+            sp.set_attribute("tool.name", name)
+            sp.set_attribute("tool.args", json.dumps(args)[:500])
+            result = impl(args, cwd)
+            sp.set_attribute("tool.result_length", len(result))
+    else:
+        result = impl(args, cwd)
+
+    if name == "execute_command" and cmd_exec_counter: cmd_exec_counter.add(1)
+    if tool_call_counter: tool_call_counter.add(1, {"tool": name})
+
+    print(f"{CYAN}--- Result ({name}) ---{RESET}\n{result.strip()[:2000]}\n{CYAN}--------------{RESET}\n")
+    return result, False
 
 def login(api_key: str):
     with open(TOKEN_FILE, "w") as f: f.write(api_key)
