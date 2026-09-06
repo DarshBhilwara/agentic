@@ -35,7 +35,12 @@ except ImportError:
 
 API_GATEWAY = os.getenv("AGENTCTL_GATEWAY_URL", "http://localhost:30080")
 VLLM_DIRECT = os.getenv("AGENTCTL_VLLM_URL", "http://localhost:30800/v1")
-OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:6006")
+
+# Support specific Trace/Metric endpoints, fallback to general endpoint
+OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+OTEL_TRACES_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+OTEL_METRICS_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+
 MODEL_NAME = os.getenv("AGENTCTL_MODEL_NAME", "qwen")
 TOKEN_FILE = os.path.expanduser("~/.agentic_token")
 
@@ -77,7 +82,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "execute_command",
-            "description": "Execute a shell command in the current fworkspace directory and return its stdout/stderr/exit code.",
+            "description": "Execute a shell command in the current workspace directory and return its stdout/stderr/exit code.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -262,16 +267,25 @@ def init_telemetry():
     })
 
     tracer_provider = TracerProvider(resource=resource)
-    if OTEL_ENDPOINT:
-        span_url = f"{OTEL_ENDPOINT.rstrip('/')}/v1/traces"
-        span_exporter = OTLPSpanExporter(endpoint=span_url)
+    
+    # Configure Trace Exporter
+    trace_url = OTEL_TRACES_ENDPOINT
+    if not trace_url and OTEL_ENDPOINT:
+        trace_url = f"{OTEL_ENDPOINT.rstrip('/')}/v1/traces"
+        
+    if trace_url:
+        span_exporter = OTLPSpanExporter(endpoint=trace_url)
         tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
 
     trace.set_tracer_provider(tracer_provider)
     tracer = trace.get_tracer("agentctl", "0.1")
 
-    if OTEL_ENDPOINT:
+    # Configure Metric Exporter
+    metric_url = OTEL_METRICS_ENDPOINT
+    if not metric_url and OTEL_ENDPOINT:
         metric_url = f"{OTEL_ENDPOINT.rstrip('/')}/v1/metrics"
+
+    if metric_url:
         metric_exporter = OTLPMetricExporter(endpoint=metric_url)
         reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=10000)
         meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
@@ -350,8 +364,14 @@ def _run_chat_repl(session_span):
     print(f"{MAGENTA}🔧 Tools:{RESET} " + ", ".join(TOOL_IMPLEMENTATIONS.keys()))
     if not os.getenv("SERPER_API_KEY"):
         print(f"{YELLOW}   (web_search disabled — set SERPER_API_KEY to enable Serper search){RESET}")
+    
     if OTEL_AVAILABLE:
-        print(f"{CYAN}📡 Telemetry (OTel):{RESET} Active ({OTEL_ENDPOINT})")
+        t_url = OTEL_TRACES_ENDPOINT or (f"{OTEL_ENDPOINT.rstrip('/')}/v1/traces" if OTEL_ENDPOINT else "Disabled")
+        m_url = OTEL_METRICS_ENDPOINT or (f"{OTEL_ENDPOINT.rstrip('/')}/v1/metrics" if OTEL_ENDPOINT else "Disabled")
+        print(f"{CYAN}📡 Telemetry (OTel):{RESET} Active")
+        print(f"{CYAN}   ├─ Traces: {RESET} {t_url}")
+        print(f"{CYAN}   └─ Metrics:{RESET} {m_url}")
+
     print(f"{YELLOW}Type '/exit' to quit, '/clear' to reset, '/refresh' to re-scan files.{RESET}\n")
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -412,7 +432,6 @@ def _do_process_llm_turn(messages: List[Dict], cwd: str, span):
                 timeout=(10, 300),
             )
 
-            # Don't hide the actual vLLM error.
             if not response.ok:
                 error_body = response.text[:4000]
                 print(
