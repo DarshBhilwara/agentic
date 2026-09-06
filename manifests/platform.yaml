@@ -111,6 +111,9 @@ spec:
         - "8000"
         - --gpu-memory-utilization
         - "0.92"
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - hermes
         env:
         - name: NVIDIA_VISIBLE_DEVICES
           value: "all"

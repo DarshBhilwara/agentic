@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: phoenix
-        image: arizeai/phoenix:latest
+        image: arizephoenix/phoenix:latest
         ports:
         - containerPort: 6006 
         - containerPort: 4317 
