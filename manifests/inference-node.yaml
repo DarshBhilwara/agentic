@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: agentic-ai}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: nvidia-device-plugin, namespace: kube-system}
+spec:
+  selector: {matchLabels: {app: nvidia-device-plugin}}
+  template:
+    metadata: {labels: {app: nvidia-device-plugin}}
+    spec:
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      containers:
+      - name: plugin
+        image: nvcr.io/nvidia/k8s-device-plugin:v0.17.1
+        securityContext: {allowPrivilegeEscalation: false}
+        env: [{name: DEVICE_LIST_STRATEGY, value: envvar}
+              ,{name: NVIDIA_VISIBLE_DEVICES, value: all}]
+        volumeMounts: [{name: devices, mountPath: /var/lib/kubelet/device-plugins}]
+      volumes: [{name: devices, hostPath: {path: /var/lib/kubelet/device-plugins}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: vllm, namespace: agentic-ai}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: vllm}}
+  template:
+    metadata: {labels: {app: vllm}}
+    spec:
+      nodeSelector: {agentic.io/role: inference}
+      runtimeClassName: nvidia
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.8.5
+        command: [sh, -c]
+        args:
+        - exec python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-14B-Instruct-AWQ --served-model-name qwen --port 8000 --gpu-memory-utilization 0.92 --enable-auto-tool-choice --tool-call-parser hermes --otlp-traces-endpoint "$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" --collect-detailed-traces all
+        ports: [{containerPort: 8000}]
+        resources: {limits: {nvidia.com/gpu: "1"}, requests: {nvidia.com/gpu: "1"}}
+        env:
+        - {name: HUGGING_FACE_HUB_TOKEN, valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}}
+        - {name: OTEL_SERVICE_NAME, value: inference-vllm}
+        - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
+        - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
+        volumeMounts: [{name: cache, mountPath: /root/.cache/huggingface}]
+      volumes: [{name: cache, hostPath: {path: /home/iiitd/Documents/agentic/model-cache, type: DirectoryOrCreate}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: vllm-service, namespace: agentic-ai}
+spec:
+  type: NodePort
+  selector: {app: vllm}
+  ports: [{name: http, port: 8000, targetPort: 8000, nodePort: 30800}]

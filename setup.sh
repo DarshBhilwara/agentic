@@ -1,10 +1,22 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-echo "=> Initializing Enterprise Agentic Platform..."
-BASE_DIR="/home/iiitd/Documents/agentic"
+NODE_ROLE="${1:-}"
+case "$NODE_ROLE" in
+  inference)
+    BASE_DIR="/home/iiitd/Documents/agentic"
+    ;;
+  agent)
+    BASE_DIR="$(pwd -P)"
+    ;;
+  *)
+    echo "Usage: $0 {inference|agent}" >&2
+    exit 2
+    ;;
+esac
 
-# 1. Anchor & create all required directories
+echo "=> Initializing Agentic Platform for the $NODE_ROLE node..."
+
 echo "=> Creating directory anchors at $BASE_DIR"
 mkdir -p "$BASE_DIR/workspace/incoming" \
          "$BASE_DIR/workspace/processed" \
@@ -12,18 +24,26 @@ mkdir -p "$BASE_DIR/workspace/incoming" \
          "$BASE_DIR/manifests" \
          "$BASE_DIR/model-cache"
 
-# 2. Force permissions to prevent container UID/GID mapping issues
 chmod -R 777 "$BASE_DIR/workspace"
 chmod -R 777 "$BASE_DIR/model-cache"
 
-# 3. Install K3s (disabling Traefik so we control our own Gateway/NodePorts)
-echo "=> Installing K3s..."
-curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -
+# The inference host bootstraps the K3s server. The agent host joins that
+# server using credentials supplied in K3S_URL and K3S_TOKEN.
+if [[ "$NODE_ROLE" == "inference" ]]; then
+  echo "=> Installing K3s server..."
+  curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -
+else
+  : "${K3S_URL:?Set K3S_URL to the inference node API endpoint, e.g. https://inference-host:6443}"
+  : "${K3S_TOKEN:?Set K3S_TOKEN to the contents of /var/lib/rancher/k3s/server/node-token on the inference node}"
+  echo "=> Joining K3s at $K3S_URL..."
+  curl -sfL https://get.k3s.io | K3S_URL="$K3S_URL" K3S_TOKEN="$K3S_TOKEN" sh -
+fi
 
-# 4. Configure K3s containerd for NVIDIA GPUs
-echo "=> Configuring NVIDIA Container Runtime..."
-mkdir -p /var/lib/rancher/k3s/agent/etc/containerd/
-cat <<EOF > /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+if [[ "$NODE_ROLE" == "inference" ]]; then
+
+  echo "=> Configuring NVIDIA Container Runtime..."
+  mkdir -p /var/lib/rancher/k3s/agent/etc/containerd/
+  cat <<EOF > /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
   runtime_type = "io.containerd.runc.v2"
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
@@ -39,7 +59,10 @@ cat <<EOF > /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
   SystemdCgroup = true
 EOF
 
-echo "=> Restarting K3s to apply GPU configuration..."
-systemctl restart k3s
+  echo "=> Restarting K3s to apply GPU configuration..."
+  systemctl restart k3s
 
-echo "=> Setup complete. Kubeconfig is at /etc/rancher/k3s/k3s.yaml"
+  echo "=> Setup complete. Kubeconfig is at /etc/rancher/k3s/k3s.yaml"
+else
+  echo "=> Agent-node directory and K3s setup complete at $BASE_DIR"
+fi
