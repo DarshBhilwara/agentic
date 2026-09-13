@@ -24,6 +24,10 @@ mkdir -p "$BASE_DIR/workspace/incoming" \
          "$BASE_DIR/manifests" \
          "$BASE_DIR/model-cache"
 
+if [[ "$NODE_ROLE" == "agent" && -f "$BASE_DIR/manifests/agent-node.yaml" ]]; then
+  sed -i "s|__AGENT_BASE_DIR__|$BASE_DIR|g" "$BASE_DIR/manifests/agent-node.yaml"
+fi
+
 chmod -R 777 "$BASE_DIR/workspace"
 chmod -R 777 "$BASE_DIR/model-cache"
 

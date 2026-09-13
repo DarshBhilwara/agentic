@@ -33,7 +33,11 @@ export K3S_TOKEN="<token-from-inference-node>"
 /path/to/setup.sh agent
 ```
 
-The inference node uses `/home/iiitd/Documents/agentic`, the agent node uses the directory from which the command was run. The setup script creates the required workspace and model-cache directories for either role.
+The inference node uses `/home/iiitd/Documents/agentic`, the agent node uses the directory from which the command was run. The setup script creates the required workspace and model-cache directories for either role and renders the agent manifest paths accordingly. Apply the rendered manifest from that same directory:
+
+```sh
+kubectl apply -f manifests/agent-node.yaml
+```
 
 Set kubeconfig on the machine used to administer the cluster:
 

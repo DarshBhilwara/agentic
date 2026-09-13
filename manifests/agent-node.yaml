@@ -8,7 +8,7 @@ spec:
   storageClassName: agentic-local
   nfs:
     server: agent-01
-    path: /home/iiitd/Documents/agentic/workspace
+    path: __AGENT_BASE_DIR__/workspace
   nodeAffinity:
     required:
       nodeSelectorTerms: [{matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [agent-01]}]}]
@@ -66,7 +66,7 @@ spec:
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
         volumeMounts: [{name: code, mountPath: /app}, {name: workspace, mountPath: /workspace}]
-      volumes: [{name: code, hostPath: {path: /home/iiitd/Documents/agentic/code}}, {name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}]
+      volumes: [{name: code, hostPath: {path: __AGENT_BASE_DIR__/code}}, {name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -100,7 +100,7 @@ spec:
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
         ports: [{containerPort: 8000}]
         volumeMounts: [{name: code, mountPath: /app}]
-      volumes: [{name: code, hostPath: {path: /home/iiitd/Documents/agentic/code}}]
+      volumes: [{name: code, hostPath: {path: __AGENT_BASE_DIR__/code}}]
 ---
 apiVersion: v1
 kind: Service
