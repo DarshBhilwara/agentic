@@ -7,11 +7,11 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   storageClassName: agentic-local
   nfs:
-    server: agent1
+    server: agent-01
     path: __AGENT_BASE_DIR__/workspace
   nodeAffinity:
     required:
-      nodeSelectorTerms: [{matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [agent1]}]}]
+      nodeSelectorTerms: [{matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [agent-01]}]}]
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
