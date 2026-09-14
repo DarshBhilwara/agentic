@@ -8,7 +8,7 @@ spec:
   storageClassName: agentic-local
   nfs:
     server: agent-01
-    path: __AGENT_BASE_DIR__/workspace
+    path: /home/darsh/research/runn/workspace
   nodeAffinity:
     required:
       nodeSelectorTerms: [{matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [agent-01]}]}]
@@ -62,13 +62,13 @@ spec:
         env:
         - {name: AGENT_MODEL_NAME, value: qwen}
         - {name: AGENT_VLLM_URL, value: "http://vllm-service:8000/v1"}
-        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "__AGENT_WORKSPACE_ROOT__"}
+        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "/home/darsh/research/runn"}
         - {name: AGENT_WORKSPACE_CONTAINER_ROOT, value: "/agent-workspaces"}
         - {name: OTEL_SERVICE_NAME, value: agent-worker}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
         volumeMounts: [{name: code, mountPath: /app}, {name: workspace, mountPath: /workspace}, {name: agent-workspaces, mountPath: /agent-workspaces}]
-      volumes: [{name: code, hostPath: {path: __AGENT_BASE_DIR__/code}}, {name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}, {name: agent-workspaces, hostPath: {path: __AGENT_WORKSPACE_ROOT__}}]
+      volumes: [{name: code, hostPath: {path: /home/darsh/research/runn/code}}, {name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}, {name: agent-workspaces, hostPath: {path: /home/darsh/research/runn}}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -98,13 +98,13 @@ spec:
               key: json
               optional: true
         - {name: OTEL_SERVICE_NAME, value: agent-gateway}
-        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "__AGENT_WORKSPACE_ROOT__"}
+        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "/home/darsh/research/runn"}
         - {name: AGENT_WORKSPACE_CONTAINER_ROOT, value: "/agent-workspaces"}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
         ports: [{containerPort: 8000}]
         volumeMounts: [{name: code, mountPath: /app}, {name: agent-workspaces, mountPath: /agent-workspaces}]
-      volumes: [{name: code, hostPath: {path: __AGENT_BASE_DIR__/code}}, {name: agent-workspaces, hostPath: {path: __AGENT_WORKSPACE_ROOT__}}]
+      volumes: [{name: code, hostPath: {path: /home/darsh/research/runn/code}}, {name: agent-workspaces, hostPath: {path: /home/darsh/research/runn}}]
 ---
 apiVersion: v1
 kind: Service

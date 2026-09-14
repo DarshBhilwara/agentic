@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import subprocess
@@ -93,6 +94,89 @@ TOOLS = [
     },
 ]
 
+# BFCL calculator tools. These are deliberately deterministic and local: they
+# give the model real structured tools to call while keeping the benchmark
+# independent of external services.
+TOOLS += [
+    {
+        "type": "function",
+        "function": {
+            "name": "calc_binomial_probability",
+            "description": "Calculate the probability of exactly k successes in n independent trials with success probability p.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer", "description": "Number of trials."},
+                    "k": {"type": "integer", "description": "Number of successes."},
+                    "p": {"type": "number", "description": "Probability of success, from 0 to 1."},
+                },
+                "required": ["n", "k", "p"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_cosine_similarity",
+            "description": "Calculate the cosine similarity of two numeric vectors.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vectorA": {"type": "array", "items": {"type": "number"}},
+                    "vectorB": {"type": "array", "items": {"type": "number"}},
+                },
+                "required": ["vectorA", "vectorB"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_density",
+            "description": "Calculate density from mass in kilograms and volume in cubic meters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mass": {"type": "number"},
+                    "volume": {"type": "number"},
+                },
+                "required": ["mass", "volume"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_displacement",
+            "description": "Calculate displacement using constant acceleration: s = ut + 0.5*a*t^2.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "initial_velocity": {"type": "number"},
+                    "acceleration": {"type": "number"},
+                    "time": {"type": "number"},
+                },
+                "required": ["initial_velocity", "acceleration", "time"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_electrostatic_potential_energy",
+            "description": "Calculate electrostatic potential energy from charge and voltage: U = qV.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "charge": {"type": "number"},
+                    "voltage": {"type": "number"},
+                },
+                "required": ["charge", "voltage"],
+            },
+        },
+    },
+]
+
 
 def _path(path: str, workspace: str) -> str:
     """Resolve a tool path while keeping it inside the user's workspace."""
@@ -168,7 +252,78 @@ def web_search(args: Dict, _workspace: str) -> str:
         return f"Error performing web search: {exc}"
 
 
-IMPLEMENTATIONS = {"execute_command": execute_command, "read_file": read_file, "write_file": write_file, "list_directory": list_directory, "web_search": web_search}
+def _number(args: Dict, name: str) -> float:
+    value = (args or {}).get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return float(value)
+
+
+def calc_binomial_probability(args: Dict, _workspace: str) -> str:
+    n, k = (args or {}).get("n"), (args or {}).get("k")
+    p = _number(args, "p")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError("n must be a non-negative integer")
+    if isinstance(k, bool) or not isinstance(k, int) or k < 0 or k > n:
+        raise ValueError("k must be an integer between 0 and n")
+    if not 0 <= p <= 1:
+        raise ValueError("p must be between 0 and 1")
+    probability = math.comb(n, k) * (p ** k) * ((1 - p) ** (n - k))
+    return json.dumps({"probability": probability})
+
+
+def calculate_cosine_similarity(args: Dict, _workspace: str) -> str:
+    vector_a = (args or {}).get("vectorA")
+    vector_b = (args or {}).get("vectorB")
+    if not isinstance(vector_a, list) or not isinstance(vector_b, list):
+        raise ValueError("vectorA and vectorB must be arrays")
+    if len(vector_a) != len(vector_b) or not vector_a:
+        raise ValueError("vectors must be non-empty and have equal length")
+    a = [_number({"value": value}, "value") for value in vector_a]
+    b = [_number({"value": value}, "value") for value in vector_b]
+    norm_a = math.sqrt(sum(value * value for value in a))
+    norm_b = math.sqrt(sum(value * value for value in b))
+    if norm_a == 0 or norm_b == 0:
+        raise ValueError("cosine similarity is undefined for a zero vector")
+    similarity = sum(x * y for x, y in zip(a, b)) / (norm_a * norm_b)
+    return json.dumps({"cosine_similarity": similarity})
+
+
+def calculate_density(args: Dict, _workspace: str) -> str:
+    mass = _number(args, "mass")
+    volume = _number(args, "volume")
+    if volume == 0:
+        raise ValueError("volume must not be zero")
+    return json.dumps({"density": mass / volume})
+
+
+def calculate_displacement(args: Dict, _workspace: str) -> str:
+    initial_velocity = _number(args, "initial_velocity")
+    acceleration = _number(args, "acceleration")
+    elapsed_time = _number(args, "time")
+    return json.dumps({"displacement": initial_velocity * elapsed_time + 0.5 * acceleration * elapsed_time ** 2})
+
+
+def calculate_electrostatic_potential_energy(args: Dict, _workspace: str) -> str:
+    charge = _number(args, "charge")
+    voltage = _number(args, "voltage")
+    return json.dumps({"electrostatic_potential_energy": charge * voltage})
+
+
+IMPLEMENTATIONS = {
+    "execute_command": execute_command,
+    "read_file": read_file,
+    "write_file": write_file,
+    "list_directory": list_directory,
+    "web_search": web_search,
+    "calc_binomial_probability": calc_binomial_probability,
+    "calculate_cosine_similarity": calculate_cosine_similarity,
+    "calculate_density": calculate_density,
+    "calculate_displacement": calculate_displacement,
+    "calculate_electrostatic_potential_energy": calculate_electrostatic_potential_energy,
+}
 
 
 def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agent_id="standalone",
@@ -188,25 +343,60 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
                      turn_id=turn_id, turn_number=turn_number, benchmark=benchmark,
                      case_id=case_id, model=MODEL_NAME):
         with span("agent.task.process", user=user, benchmark=benchmark, case_id=case_id):
-            for _ in range(12):
-                with span("agent.inference", model=MODEL_NAME):
+            for step_number in range(1, 13):
+                with span("agent.inference", model=MODEL_NAME,
+                          **{
+                              "agent.step.number": step_number,
+                              "agent.step.kind": "model_inference",
+                          }) as inference_span:
                     inference_counter.add(1, {"model": MODEL_NAME})
                     response = client.chat.completions.create(model=MODEL_NAME, messages=messages, tools=TOOLS, tool_choice="auto", max_tokens=4096, temperature=0.1)
-                message = response.choices[0].message
-                tool_calls = message.tool_calls or []
-                messages.append(message.model_dump(exclude_none=True))
-                if not tool_calls:
-                    return message.content or "", messages
-                for call in tool_calls:
-                    try:
-                        args = json.loads(call.function.arguments or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
-                    implementation = IMPLEMENTATIONS.get(call.function.name)
-                    with span(f"agent.tool.{call.function.name}", user=user, **{
-                        "gen_ai.tool.name": call.function.name,
-                        "gen_ai.tool.call.id": call.id,
-                    }):
-                        result = implementation(args, workspace) if implementation else f"Error: unknown tool '{call.function.name}'."
-                    messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+                    message = response.choices[0].message
+                    tool_calls = message.tool_calls or []
+                    tool_names = [call.function.name for call in tool_calls]
+                    step_intent = (
+                        f"execute_tool:{tool_names[0]}"
+                        if tool_names else "produce_final_response"
+                    )
+                    inference_span.set_attribute("agent.step.intent", step_intent)
+                    inference_span.set_attribute("agent.step.next_action", "tool_execution" if tool_names else "return_response")
+                    inference_span.set_attribute("agent.step.tool_names", json.dumps(tool_names))
+                    inference_span.add_event("agent.step.intent", {
+                        "agent.step.number": step_number,
+                        "agent.step.intent": step_intent,
+                        "agent.step.next_action": "tool_execution" if tool_names else "return_response",
+                        "agent.step.tool_names": json.dumps(tool_names),
+                    })
+                    messages.append(message.model_dump(exclude_none=True))
+                    if not tool_calls:
+                        return message.content or "", messages
+                    for call in tool_calls:
+                        try:
+                            args = json.loads(call.function.arguments or "{}")
+                        except json.JSONDecodeError:
+                            args = {}
+                        implementation = IMPLEMENTATIONS.get(call.function.name)
+                        with span(f"agent.tool.{call.function.name}", user=user, **{
+                            "gen_ai.tool.name": call.function.name,
+                            "gen_ai.tool.call.id": call.id,
+                            "gen_ai.tool.call.arguments": call.function.arguments or "{}",
+                            "agent.step.number": step_number,
+                            "agent.step.kind": "tool_execution",
+                            "agent.step.intent": f"execute_tool:{call.function.name}",
+                            "agent.step.next_action": "return_observation_to_model",
+                        }) as tool_span:
+                            tool_span.add_event("agent.tool.intent", {
+                                "agent.step.number": step_number,
+                                "agent.step.intent": f"execute_tool:{call.function.name}",
+                                "gen_ai.tool.name": call.function.name,
+                                "gen_ai.tool.call.arguments": call.function.arguments or "{}",
+                            })
+                            try:
+                                result = implementation(args, workspace) if implementation else f"Error: unknown tool '{call.function.name}'."
+                            except Exception as exc:
+                                tool_span.record_exception(exc)
+                                tool_span.set_attribute("error.type", type(exc).__name__)
+                                result = f"Error: {exc}"
+                            tool_span.set_attribute("gen_ai.tool.result", result)
+                        messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
             return "The agent stopped after reaching the maximum number of tool rounds.", messages
