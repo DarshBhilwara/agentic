@@ -42,6 +42,19 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _workspace(path):
+    requested = os.path.realpath(path or os.path.join("/workspace", "users"))
+    host_root = os.path.realpath(os.getenv("AGENT_WORKSPACE_HOST_ROOT", ""))
+    container_root = os.path.realpath(os.getenv("AGENT_WORKSPACE_CONTAINER_ROOT", "/agent-workspaces"))
+    if host_root and requested == host_root:
+        return container_root
+    if host_root and requested.startswith(host_root + os.sep):
+        return os.path.join(container_root, os.path.relpath(requested, host_root))
+    if requested.startswith("/workspace/users/"):
+        return requested
+    raise HTTPException(400, detail="workspace must be inside the configured shared project root")
+
+
 def _session(session_id, user):
     session = r.hgetall(f"session:{session_id}")
     if not session or session.get(b"user", b"").decode() != user:
@@ -50,12 +63,13 @@ def _session(session_id, user):
 
 
 @app.post("/sessions")
-def create_session(user: str = Depends(verify_key)):
+def create_session(workspace: str = "", user: str = Depends(verify_key)):
     session_id = str(uuid.uuid4())
     agent_id = str(uuid.uuid4())
+    workspace = _workspace(workspace or os.path.join("/workspace/users", user))
     r.hset(f"session:{session_id}", mapping={
         "id": session_id, "user": user, "agent_id": agent_id,
-        "created_at": _now(), "turn": 0,
+        "workspace": workspace, "created_at": _now(), "turn": 0,
     })
     return {"session_id": session_id, "agent_id": agent_id}
 
@@ -71,6 +85,7 @@ def submit_message(session_id: str, prompt: str, user: str = Depends(verify_key)
         r.hset(f"task:{task_id}", mapping={
             "id": task_id, "user": user, "prompt": prompt, "status": "pending",
             "session_id": session_id, "agent_id": session["agent_id"],
+            "workspace": session["workspace"],
             "turn_id": turn_id, "turn_number": turn_number,
             "created_at": _now(), "trace_context": json.dumps(inject_context()),
         })
@@ -83,7 +98,7 @@ def submit_message(session_id: str, prompt: str, user: str = Depends(verify_key)
 @app.post("/tasks")
 def submit_task(prompt: str, user: str = Depends(verify_key)):
     """Compatibility endpoint for non-interactive clients."""
-    session = create_session(user)
+    session = create_session(user=user)
     return submit_message(session["session_id"], prompt, user)
 
 @app.get("/tasks/{task_id}")

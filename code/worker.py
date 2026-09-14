@@ -30,6 +30,7 @@ while True:
                     task_counter.add(1, {"component": "worker"})
                     result, conversation = run(
                         task[b"prompt"].decode(), user,
+                        workspace=task.get(b"workspace", b"/workspace/users/" + user.encode()).decode(),
                         session_id=session_id,
                         agent_id=agent_id,
                         turn_id=turn_id,

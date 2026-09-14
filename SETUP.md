@@ -9,7 +9,7 @@ This deployment has three Kubernetes layers:
 | `agent-node.yaml` | Smaller agent server | API gateway, Redis, and agent workers |
 | `inference-node.yaml` | GPU inference server | vLLM and the model cache |
 
-`agentctl` connects to the agent gateway. It does not connect directly to the worker, inference server, workspace, or telemetry services.
+`agentctl` connects to the agent gateway. Its current directory is sent as the agent workspace; the backend queues and executes the work there. The backend `/workspace/users` volume remains available for backend-owned artifacts.
 
 ## Prerequisites
 Install NVIDIA drivers plus the NVIDIA Container Toolkit on the inference server. Ensure the agent server can export its workspace over NFS. Bootstrap the inference node with:
@@ -125,7 +125,7 @@ Install the client dependency on the client machine:
 python3 -m pip install requests
 export AGENTCTL_GATEWAY_URL="http://<agent-host>:30080"
 ./agentctl login <user-token>
-./agentctl
+./agentctl /path/to/project
 ./agentctl list
 ```
 

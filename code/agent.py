@@ -171,13 +171,15 @@ def web_search(args: Dict, _workspace: str) -> str:
 IMPLEMENTATIONS = {"execute_command": execute_command, "read_file": read_file, "write_file": write_file, "list_directory": list_directory, "web_search": web_search}
 
 
-def run(prompt: str, user: str, *, session_id="standalone", agent_id="standalone",
+def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agent_id="standalone",
         turn_id="standalone", turn_number=1, conversation=None, benchmark=None,
         case_id=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", user):
         raise ValueError("invalid user identity")
-    workspace = os.path.join("/workspace/users", user)
-    os.makedirs(workspace, exist_ok=True)
+    workspace = workspace or os.path.join("/workspace/users", user)
+    workspace = os.path.realpath(workspace)
+    if not os.path.isdir(workspace):
+        raise ValueError(f"workspace does not exist: {workspace}")
     client = OpenAI(base_url=VLLM_URL, api_key="EMPTY")
     messages: List[Dict] = conversation or [{"role": "system", "content": SYSTEM_PROMPT.format(workspace=workspace)}]
     messages.append({"role": "user", "content": prompt})

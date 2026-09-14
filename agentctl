@@ -41,8 +41,9 @@ def wait_for_task(task_id):
             raise RuntimeError(status.get("error", "Unknown agent error"))
         time.sleep(1)
 
-def chat():
-    session = request("POST", "/sessions")
+def chat(location):
+    location = os.path.abspath(location)
+    session = request("POST", "/sessions", params={"workspace": location})
     print("Connected. Type /exit to leave, /new to start a new agent session.")
     print(f"Session {session['session_id']}\n")
     while True:
@@ -56,7 +57,7 @@ def chat():
         if prompt.strip() in {"/exit", "/quit"}:
             return
         if prompt.strip() == "/new":
-            session = request("POST", "/sessions")
+            session = request("POST", "/sessions", params={"workspace": location})
             print(f"Started session {session['session_id']}")
             continue
         try:
@@ -65,9 +66,9 @@ def chat():
         except (requests.RequestException, RuntimeError) as exc:
             print(f"agent error: {exc}", file=sys.stderr)
 
-def submit(prompt, watch):
+def submit(prompt, watch, location):
     try:
-        session = request("POST", "/sessions")
+        session = request("POST", "/sessions", params={"workspace": os.path.abspath(location)})
         task = request("POST", f"/sessions/{session['session_id']}/messages", params={"prompt": prompt})
         print(f"Task {task['task_id']} queued")
         if watch:
@@ -82,14 +83,20 @@ login_parser.add_argument("token")
 submit_parser = commands.add_parser("submit", help="Submit one task")
 submit_parser.add_argument("prompt")
 submit_parser.add_argument("-w", "--watch", action="store_true")
+submit_parser.add_argument("-C", "--location", default=".", help="Project directory")
 commands.add_parser("chat", help="Start an interactive agent session")
-args = parser.parse_args()
+chat_parser = commands.choices["chat"]
+chat_parser.add_argument("location", help="Project directory to operate on")
+argv = sys.argv[1:]
+if argv and argv[0] not in {"login", "submit", "chat", "-h", "--help"}:
+    argv = ["chat", *argv]
+args = parser.parse_args(argv)
 
 if args.command == "login":
     login(args.token)
 elif args.command == "submit":
-    submit(args.prompt, args.watch)
-elif args.command in {"chat", None}:
-    chat()
+    submit(args.prompt, args.watch, args.location)
+elif args.command == "chat":
+    chat(args.location)
 else:
     parser.print_help()

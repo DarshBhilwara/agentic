@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -35,13 +36,18 @@ def main():
     parser.add_argument("dataset", type=Path, help="A BFCL JSONL category file")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--user", default="bfcl-benchmark")
+    parser.add_argument("--location", default=os.getcwd(),
+                        help="Project directory the agent may inspect or edit")
     args = parser.parse_args()
 
     started = time.time()
     count = 0
     for case in load_cases(args.dataset, args.limit):
         case_id = str(case.get("id", count))
-        result, _ = run(prompt_for(case), args.user, agent_id="bfcl-benchmark", session_id=f"bfcl-{case_id}", turn_id=case_id, benchmark="bfcl", case_id=case_id)
+        result, _ = run(prompt_for(case), args.user,
+                        workspace=os.path.abspath(args.location),
+                        agent_id="bfcl-benchmark", session_id=f"bfcl-{case_id}",
+                        turn_id=case_id, benchmark="bfcl", case_id=case_id)
         print(json.dumps({"id": case_id, "result": result}, ensure_ascii=False), flush=True)
         count += 1
     print(json.dumps({"benchmark": "bfcl", "cases": count, "elapsed_s": round(time.time() - started, 3)}))

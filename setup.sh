@@ -26,6 +26,7 @@ mkdir -p "$BASE_DIR/workspace/incoming" \
 
 if [[ "$NODE_ROLE" == "agent" && -f "$BASE_DIR/manifests/agent-node.yaml" ]]; then
   sed -i "s|__AGENT_BASE_DIR__|$BASE_DIR|g" "$BASE_DIR/manifests/agent-node.yaml"
+  sed -i "s|__AGENT_WORKSPACE_ROOT__|$(dirname "$BASE_DIR")|g" "$BASE_DIR/manifests/agent-node.yaml"
 fi
 
 chmod -R 777 "$BASE_DIR/workspace"
