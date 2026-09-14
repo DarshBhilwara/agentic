@@ -79,13 +79,13 @@ kubectl -n agentic-ai create secret generic hf-token \
 
 ## Telemetry architecture
 
-All application and host telemetry enters through the internal service `otel-collector:4318`:
+All application and host telemetry enters through the internal service `otel-collector:4318`, whose collector deployment is pinned to the node labelled `agentic.io/role=inference`:
 
 1. Agent gateway and worker emit agent intent, tool-call, task, and inference spans.
 2. `otel-node-collector` runs on every node and emits CPU, memory, disk, filesystem, network, process, and process-state metrics.
 3. vLLM emits inference traces and its Prometheus metrics are scraped by the Collector.
 
-The Collector sends traces to Phoenix and metrics to Prometheus remote write. Trace IDs and resource attributes provide the common correlation keys for a future correlation engine. The DSL and log-query engine are not part of this deployment yet.
+The Collector sends traces to Phoenix and metrics to Prometheus remote write. Trace IDs and resource attributes provide the common correlation keys. Currently we have implemented agent intent. Every intent span also has `agent.id`, `agent.session.id`, `agent.turn.id`, `agent.turn.number`, `intent.started_at`, and `intent.completed_at` so intents are separable by agent and time.
 
 The default externally exposed services are:
 
@@ -125,7 +125,7 @@ Install the client dependency on the client machine:
 python3 -m pip install requests
 export AGENTCTL_GATEWAY_URL="http://<agent-host>:30080"
 ./agentctl login <user-token>
-./agentctl submit "Inspect my workspace and summarize its contents" --watch
+./agentctl
 ./agentctl list
 ```
 

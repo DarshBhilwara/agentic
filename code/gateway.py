@@ -2,8 +2,9 @@ import json
 import os
 import re
 import redis, uuid
+from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, Header
-from telemetry import span, task_counter
+from telemetry import inject_context, span, task_counter
 
 app = FastAPI()
 r = redis.Redis(host='redis-service', port=6379, db=0)
@@ -37,15 +38,53 @@ def verify_key(x_api_key: str = Header(...)):
         return user
     raise HTTPException(status_code=401, detail="Invalid Enterprise Token")
 
-@app.post("/tasks")
-def submit_task(prompt: str, user: str = Depends(verify_key)):
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _session(session_id, user):
+    session = r.hgetall(f"session:{session_id}")
+    if not session or session.get(b"user", b"").decode() != user:
+        raise HTTPException(404, detail="Session not found")
+    return {key.decode(): value.decode() for key, value in session.items()}
+
+
+@app.post("/sessions")
+def create_session(user: str = Depends(verify_key)):
+    session_id = str(uuid.uuid4())
+    agent_id = str(uuid.uuid4())
+    r.hset(f"session:{session_id}", mapping={
+        "id": session_id, "user": user, "agent_id": agent_id,
+        "created_at": _now(), "turn": 0,
+    })
+    return {"session_id": session_id, "agent_id": agent_id}
+
+
+@app.post("/sessions/{session_id}/messages")
+def submit_message(session_id: str, prompt: str, user: str = Depends(verify_key)):
+    session = _session(session_id, user)
     task_counter.add(1, {"component": "gateway", "operation": "submit"})
     with span("agent.task.submit", user=user) as s:
         task_id = str(uuid.uuid4())
-        r.hset(f"task:{task_id}", mapping={"id": task_id, "user": user, "prompt": prompt, "status": "pending"})
+        turn_id = str(uuid.uuid4())
+        turn_number = r.hincrby(f"session:{session_id}", "turn", 1)
+        r.hset(f"task:{task_id}", mapping={
+            "id": task_id, "user": user, "prompt": prompt, "status": "pending",
+            "session_id": session_id, "agent_id": session["agent_id"],
+            "turn_id": turn_id, "turn_number": turn_number,
+            "created_at": _now(), "trace_context": json.dumps(inject_context()),
+        })
         r.lpush("task_queue", task_id)
         s.set_attribute("task.id", task_id)
-        return {"task_id": task_id, "status": "queued"}
+        s.set_attribute("agent.session.id", session_id)
+        return {"task_id": task_id, "status": "queued", "turn_id": turn_id}
+
+
+@app.post("/tasks")
+def submit_task(prompt: str, user: str = Depends(verify_key)):
+    """Compatibility endpoint for non-interactive clients."""
+    session = create_session(user)
+    return submit_message(session["session_id"], prompt, user)
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str, user: str = Depends(verify_key)):

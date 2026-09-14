@@ -41,7 +41,7 @@ def main():
     count = 0
     for case in load_cases(args.dataset, args.limit):
         case_id = str(case.get("id", count))
-        result = run(prompt_for(case), args.user, benchmark="bfcl", case_id=case_id)
+        result, _ = run(prompt_for(case), args.user, agent_id="bfcl-benchmark", session_id=f"bfcl-{case_id}", turn_id=case_id, benchmark="bfcl", case_id=case_id)
         print(json.dumps({"id": case_id, "result": result}, ensure_ascii=False), flush=True)
         count += 1
     print(json.dumps({"benchmark": "bfcl", "cases": count, "elapsed_s": round(time.time() - started, 3)}))

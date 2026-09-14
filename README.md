@@ -37,5 +37,5 @@ Then connect through the agent gateway:
 ```sh
 export AGENTCTL_GATEWAY_URL="http://<agent-host>:30080"
 ./agentctl login <user-token>
-./agentctl submit "Inspect my workspace" --watch
+./agentctl
 ```

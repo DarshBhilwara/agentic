@@ -171,15 +171,20 @@ def web_search(args: Dict, _workspace: str) -> str:
 IMPLEMENTATIONS = {"execute_command": execute_command, "read_file": read_file, "write_file": write_file, "list_directory": list_directory, "web_search": web_search}
 
 
-def run(prompt: str, user: str, *, benchmark=None, case_id=None) -> str:
+def run(prompt: str, user: str, *, session_id="standalone", agent_id="standalone",
+        turn_id="standalone", turn_number=1, conversation=None, benchmark=None,
+        case_id=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", user):
         raise ValueError("invalid user identity")
     workspace = os.path.join("/workspace/users", user)
     os.makedirs(workspace, exist_ok=True)
     client = OpenAI(base_url=VLLM_URL, api_key="EMPTY")
-    messages: List[Dict] = [{"role": "system", "content": SYSTEM_PROMPT.format(workspace=workspace)}, {"role": "user", "content": prompt}]
+    messages: List[Dict] = conversation or [{"role": "system", "content": SYSTEM_PROMPT.format(workspace=workspace)}]
+    messages.append({"role": "user", "content": prompt})
 
-    with intent_span(prompt, user=user, benchmark=benchmark, case_id=case_id, model=MODEL_NAME):
+    with intent_span(prompt, user=user, agent_id=agent_id, session_id=session_id,
+                     turn_id=turn_id, turn_number=turn_number, benchmark=benchmark,
+                     case_id=case_id, model=MODEL_NAME):
         with span("agent.task.process", user=user, benchmark=benchmark, case_id=case_id):
             for _ in range(12):
                 with span("agent.inference", model=MODEL_NAME):
@@ -189,7 +194,7 @@ def run(prompt: str, user: str, *, benchmark=None, case_id=None) -> str:
                 tool_calls = message.tool_calls or []
                 messages.append(message.model_dump(exclude_none=True))
                 if not tool_calls:
-                    return message.content or ""
+                    return message.content or "", messages
                 for call in tool_calls:
                     try:
                         args = json.loads(call.function.arguments or "{}")
@@ -202,4 +207,4 @@ def run(prompt: str, user: str, *, benchmark=None, case_id=None) -> str:
                     }):
                         result = implementation(args, workspace) if implementation else f"Error: unknown tool '{call.function.name}'."
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-            return "The agent stopped after reaching the maximum number of tool rounds."
+            return "The agent stopped after reaching the maximum number of tool rounds.", messages

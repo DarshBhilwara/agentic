@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""Authenticated access client for the agent node."""
-
 import argparse
 import os
 import sys
 import time
-
 import requests
-
 
 API_GATEWAY = os.getenv("AGENTCTL_GATEWAY_URL", "http://localhost:30080")
 TOKEN_FILE = os.path.expanduser("~/.agentic_token")
-
 
 def get_token():
     try:
@@ -23,10 +18,8 @@ def get_token():
         raise SystemExit("Unauthenticated. Run 'agentctl login <token>' first.")
     return token
 
-
 def headers():
     return {"X-API-Key": get_token()}
-
 
 def login(token):
     with open(TOKEN_FILE, "w") as file:
@@ -34,53 +27,69 @@ def login(token):
     os.chmod(TOKEN_FILE, 0o600)
     print("Authenticated successfully.")
 
+def request(method, path, **kwargs):
+    response = requests.request(method, f"{API_GATEWAY}{path}", headers=headers(), timeout=30, **kwargs)
+    response.raise_for_status()
+    return response.json()
+
+def wait_for_task(task_id):
+    while True:
+        status = request("GET", f"/tasks/{task_id}")
+        if status["status"] == "completed":
+            return status.get("result", "")
+        if status["status"] == "failed":
+            raise RuntimeError(status.get("error", "Unknown agent error"))
+        time.sleep(1)
+
+def chat():
+    session = request("POST", "/sessions")
+    print("Connected. Type /exit to leave, /new to start a new agent session.")
+    print(f"Session {session['session_id']}\n")
+    while True:
+        try:
+            prompt = input("you > ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not prompt.strip():
+            continue
+        if prompt.strip() in {"/exit", "/quit"}:
+            return
+        if prompt.strip() == "/new":
+            session = request("POST", "/sessions")
+            print(f"Started session {session['session_id']}")
+            continue
+        try:
+            task = request("POST", f"/sessions/{session['session_id']}/messages", params={"prompt": prompt})
+            print(f"\nagent > {wait_for_task(task['task_id'])}\n")
+        except (requests.RequestException, RuntimeError) as exc:
+            print(f"agent error: {exc}", file=sys.stderr)
 
 def submit(prompt, watch):
     try:
-        response = requests.post(f"{API_GATEWAY}/tasks", params={"prompt": prompt}, headers=headers(), timeout=15)
-        response.raise_for_status()
-        task_id = response.json()["task_id"]
-        print(f"Task queued. Task ID: {task_id}")
+        session = request("POST", "/sessions")
+        task = request("POST", f"/sessions/{session['session_id']}/messages", params={"prompt": prompt})
+        print(f"Task {task['task_id']} queued")
         if watch:
-            while True:
-                status = requests.get(f"{API_GATEWAY}/tasks/{task_id}", headers=headers(), timeout=15).json()
-                if status["status"] == "completed":
-                    print(f"\n--- Output ---\n{status.get('result', '')}")
-                    return
-                if status["status"] == "failed":
-                    raise RuntimeError(status.get("error", "Unknown agent error"))
-                print(f"\rStatus: {status['status'].upper()}", end="", flush=True)
-                time.sleep(2)
+            print(wait_for_task(task["task_id"]))
     except (requests.RequestException, RuntimeError) as exc:
         print(f"Connection or agent error: {exc}", file=sys.stderr)
 
-
-def list_tasks():
-    try:
-        response = requests.get(f"{API_GATEWAY}/tasks", headers=headers(), timeout=15)
-        response.raise_for_status()
-        print(f"{'TASK ID':<40} | STATUS\n{'-' * 60}")
-        for task in response.json():
-            print(f"{task['id']:<40} | {task['status'].upper()}")
-    except requests.RequestException as exc:
-        print(f"Connection error: {exc}", file=sys.stderr)
-
-
-parser = argparse.ArgumentParser(description="Authenticated access to the agent node")
+parser = argparse.ArgumentParser(description="Interactive access to the agent backend")
 commands = parser.add_subparsers(dest="command")
 login_parser = commands.add_parser("login", help="Store an enterprise access token")
 login_parser.add_argument("token")
-submit_parser = commands.add_parser("submit", help="Submit a task to the agent node")
+submit_parser = commands.add_parser("submit", help="Submit one task")
 submit_parser.add_argument("prompt")
 submit_parser.add_argument("-w", "--watch", action="store_true")
-commands.add_parser("list", help="List your tasks")
+commands.add_parser("chat", help="Start an interactive agent session")
 args = parser.parse_args()
 
 if args.command == "login":
     login(args.token)
 elif args.command == "submit":
     submit(args.prompt, args.watch)
-elif args.command == "list":
-    list_tasks()
+elif args.command in {"chat", None}:
+    chat()
 else:
     parser.print_help()

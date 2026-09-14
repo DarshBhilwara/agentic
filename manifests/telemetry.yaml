@@ -138,6 +138,8 @@ spec:
       labels:
         app: otel-collector-gateway
     spec:
+      nodeSelector:
+        agentic.io/role: inference
       containers:
       - name: otel-collector
         image: otel/opentelemetry-collector-contrib:0.120.0
