@@ -75,7 +75,8 @@ def create_session(workspace: str = "", user: str = Depends(verify_key)):
 
 
 @app.post("/sessions/{session_id}/messages")
-def submit_message(session_id: str, prompt: str, user: str = Depends(verify_key)):
+def submit_message(session_id: str, prompt: str, benchmark: str = "",
+                   case_id: str = "", user: str = Depends(verify_key)):
     session = _session(session_id, user)
     task_counter.add(1, {"component": "gateway", "operation": "submit"})
     with span("agent.task.submit", user=user) as s:
@@ -86,6 +87,7 @@ def submit_message(session_id: str, prompt: str, user: str = Depends(verify_key)
             "id": task_id, "user": user, "prompt": prompt, "status": "pending",
             "session_id": session_id, "agent_id": session["agent_id"],
             "workspace": session["workspace"],
+            "benchmark": benchmark, "case_id": case_id,
             "turn_id": turn_id, "turn_number": turn_number,
             "created_at": _now(), "trace_context": json.dumps(inject_context()),
         })
@@ -99,7 +101,7 @@ def submit_message(session_id: str, prompt: str, user: str = Depends(verify_key)
 def submit_task(prompt: str, user: str = Depends(verify_key)):
     """Compatibility endpoint for non-interactive clients."""
     session = create_session(user=user)
-    return submit_message(session["session_id"], prompt, user)
+    return submit_message(session["session_id"], prompt, user=user)
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str, user: str = Depends(verify_key)):

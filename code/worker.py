@@ -36,6 +36,8 @@ while True:
                         turn_id=turn_id,
                         turn_number=turn_number,
                         conversation=conversation,
+                        benchmark=task.get(b"benchmark", b"").decode() or None,
+                        case_id=task.get(b"case_id", b"").decode() or None,
                     )
             r.set(conversation_key, json.dumps(conversation))
             r.hset(f"task:{task_id}", mapping={"status": "completed", "result": result, "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
