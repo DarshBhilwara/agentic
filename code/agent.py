@@ -325,6 +325,52 @@ IMPLEMENTATIONS = {
     "calculate_electrostatic_potential_energy": calculate_electrostatic_potential_energy,
 }
 
+TOOL_INTENT = {
+    "execute_command": ("workspace_command_execution", "execute_workspace_command"),
+    "read_file": ("workspace_file_read", "read_workspace_file"),
+    "write_file": ("workspace_file_write", "write_workspace_file"),
+    "list_directory": ("workspace_directory_inspection", "inspect_workspace_directory"),
+    "web_search": ("current_information_retrieval", "retrieve_current_information"),
+    "calc_binomial_probability": ("probability_calculation", "calculate_binomial_probability"),
+    "calculate_cosine_similarity": ("vector_calculation", "calculate_vector_similarity"),
+    "calculate_density": ("physics_calculation", "calculate_density"),
+    "calculate_displacement": ("physics_calculation", "calculate_displacement"),
+    "calculate_electrostatic_potential_energy": (
+        "physics_calculation", "calculate_electrostatic_potential_energy"
+    ),
+}
+
+
+def tool_intent(tool_name):
+    return TOOL_INTENT.get(
+        tool_name, ("unsupported_tool_action", "unknown_tool_requested")
+    )
+
+
+def intent_decision(tool_names):
+    if not tool_names:
+        return {
+            "decision": "respond_directly",
+            "tool_required": False,
+            "action": "direct_response",
+            "reason_code": "no_tool_call_selected",
+            "tool_name": "",
+            "tool_names": [],
+            "tool_actions": [],
+        }
+
+    primary_tool = tool_names[0]
+    action, reason_code = tool_intent(primary_tool)
+    return {
+        "decision": "use_tool",
+        "tool_required": True,
+        "action": action,
+        "reason_code": reason_code,
+        "tool_name": primary_tool,
+        "tool_names": tool_names,
+        "tool_actions": [tool_intent(name)[0] for name in tool_names],
+    }
+
 
 def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agent_id="standalone",
         turn_id="standalone", turn_number=1, conversation=None, benchmark=None,
@@ -341,7 +387,7 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
 
     with intent_span(prompt, user=user, agent_id=agent_id, session_id=session_id,
                      turn_id=turn_id, turn_number=turn_number, benchmark=benchmark,
-                     case_id=case_id, model=MODEL_NAME):
+                     case_id=case_id, model=MODEL_NAME) as turn_span:
         with span("agent.task.process", user=user, benchmark=benchmark, case_id=case_id):
             for step_number in range(1, 13):
                 with span("agent.inference", model=MODEL_NAME,
@@ -354,19 +400,32 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
                     message = response.choices[0].message
                     tool_calls = message.tool_calls or []
                     tool_names = [call.function.name for call in tool_calls]
-                    step_intent = (
-                        f"execute_tool:{tool_names[0]}"
-                        if tool_names else "produce_final_response"
-                    )
+                    decision = intent_decision(tool_names)
+                    step_intent = decision["action"]
+                    next_action = "tool_execution" if tool_names else "return_response"
+                    decision_fields = {
+                        "agent.intent.decision": decision["decision"],
+                        "agent.intent.tool_required": decision["tool_required"],
+                        "agent.intent.action": decision["action"],
+                        "agent.intent.reason_code": decision["reason_code"],
+                        "agent.intent.tool_name": decision["tool_name"],
+                        "agent.intent.tool_names": json.dumps(decision["tool_names"]),
+                        "agent.intent.tool_count": len(decision["tool_names"]),
+                        "agent.intent.tool_actions": json.dumps(decision["tool_actions"]),
+                    }
+                    for key, value in decision_fields.items():
+                        inference_span.set_attribute(key, value)
                     inference_span.set_attribute("agent.step.intent", step_intent)
-                    inference_span.set_attribute("agent.step.next_action", "tool_execution" if tool_names else "return_response")
+                    inference_span.set_attribute("agent.step.next_action", next_action)
                     inference_span.set_attribute("agent.step.tool_names", json.dumps(tool_names))
-                    inference_span.add_event("agent.step.intent", {
+                    inference_span.add_event("agent.intent.decision", {
                         "agent.step.number": step_number,
-                        "agent.step.intent": step_intent,
-                        "agent.step.next_action": "tool_execution" if tool_names else "return_response",
-                        "agent.step.tool_names": json.dumps(tool_names),
+                        **decision_fields,
                     })
+                    # Keep the latest decision on the turn span so a trace can
+                    # be queried without expanding every inference child span.
+                    for key, value in decision_fields.items():
+                        turn_span.set_attribute(key, value)
                     messages.append(message.model_dump(exclude_none=True))
                     if not tool_calls:
                         return message.content or "", messages
@@ -382,12 +441,16 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
                             "gen_ai.tool.call.arguments": call.function.arguments or "{}",
                             "agent.step.number": step_number,
                             "agent.step.kind": "tool_execution",
-                            "agent.step.intent": f"execute_tool:{call.function.name}",
+                            "agent.step.intent": tool_intent(call.function.name)[0],
+                            "agent.intent.action": tool_intent(call.function.name)[0],
+                            "agent.intent.reason_code": tool_intent(call.function.name)[1],
                             "agent.step.next_action": "return_observation_to_model",
                         }) as tool_span:
                             tool_span.add_event("agent.tool.intent", {
                                 "agent.step.number": step_number,
-                                "agent.step.intent": f"execute_tool:{call.function.name}",
+                                "agent.step.intent": tool_intent(call.function.name)[0],
+                                "agent.intent.action": tool_intent(call.function.name)[0],
+                                "agent.intent.reason_code": tool_intent(call.function.name)[1],
                                 "gen_ai.tool.name": call.function.name,
                                 "gen_ai.tool.call.arguments": call.function.arguments or "{}",
                             })

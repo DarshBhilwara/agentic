@@ -144,5 +144,25 @@ BFCL_CASES=$(find /tmp/BFCL/berkeley-function-call-leaderboard/bfcl_eval/data \
 python3 benchmarks/run_bfcl_intent.py "$BFCL_CASES" --limit 10
 ```
 
-Each case emits a `gen_ai.invoke_agent` span with the benchmark name and case
-ID, plus a `gen_ai.user.message` intent event.
+Each case emits a `gen_ai.invoke_agent` span with the benchmark name and case ID, plus a `gen_ai.user.message` intent event.
+
+Each model inference also emits an `agent.intent.decision` event and matching span attributes. The decision is deliberately structured and bounded:
+
+```text
+agent.intent.decision       use_tool | respond_directly
+agent.intent.tool_required  true | false
+agent.intent.action         current_information_retrieval, workspace_file_read,
+                            workspace_file_write, workspace_command_execution,
+                            workspace_directory_inspection, probability_calculation,
+                            vector_calculation, physics_calculation, direct_response
+agent.intent.reason_code    retrieve_current_information, read_workspace_file,
+                            write_workspace_file, execute_workspace_command,
+                            inspect_workspace_directory, calculate_*,
+                            no_tool_call_selected
+agent.intent.tool_name      primary selected tool, if any
+agent.intent.tool_names      JSON list of all selected tools
+agent.intent.tool_actions    JSON list aligned with tool_names
+agent.intent.tool_count      number of selected tools
+```
+
+For example, a search call is recorded as `decision=use_tool`, `action=current_information_retrieval`, and `reason_code=retrieve_current_information`; a direct answer is recorded as `decision=respond_directly`, `action=direct_response`, and `reason_code=no_tool_call_selected`. These fields describe the model's observable next action and do not store hidden chain-of-thought.
