@@ -25,7 +25,9 @@ def prompt_for(case):
     # Explicit allowlist: never send patch, test_patch, fail_to_pass,
     # pass_to_pass, or grading scripts to the model.
     parts = ["Fix the issue in the current repository. Inspect the code, implement the fix, "
-             "and run relevant tests available in the repository. Leave your changes in the working tree."]
+             "and run relevant tests available in the repository. Leave your changes in the working tree. "
+             "Do not claim to have changed files unless you actually changed them. If a command or test "
+             "dependency is unavailable, continue by inspecting and editing with the other available tools."]
     for key in ("problem_statement", "requirements", "interface"):
         if case.get(key):
             parts.append(f"{key}:\n{case[key]}")
@@ -141,6 +143,8 @@ def run_case(case, args, experiment_id, revision, token):
             # the dataset base. Only this newly created checkout is modified.
             git(workspace, "add", "--intent-to-add", "--", ".")
             patch = git(workspace, "diff", "--binary", case["base_commit"], "--")
+            record["patch_generated"] = bool(patch)
+            record["patch_bytes"] = len(patch.encode())
             prediction = {"instance_id": instance_id, "patch": patch, "prefix": experiment_id}
             (destination / "prediction.json").write_text(json.dumps(prediction))
             (destination / "model.patch").write_text(patch)

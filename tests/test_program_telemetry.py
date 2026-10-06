@@ -245,5 +245,7 @@ def test_swe_runner_exports_patch_and_program_metrics(backend, fake_model, monke
     assert record["task_status"] == "Success"
     assert record["resolved"] is None
     assert record["evaluation_status"] == "NotEvaluated"
+    assert record["patch_generated"] is True
+    assert record["patch_bytes"] > 0
     patch = next(args.output.glob("*/model.patch")).read_text()
     assert "new.py" in patch and "+answer = 42" in patch

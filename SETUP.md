@@ -269,7 +269,9 @@ program/step/inference/tool spans; summaries in Redis are the source for numeric
 per-program exports. Events are paginated; the runner exports the retained tail
 in full. Polling/network errors are `runner_error`, not invented task outcomes.
 
-This runner uses separate checkouts in the shared worker environment. It does
+This runner uses separate checkouts in the shared worker environment. The
+worker image includes Python and Node.js/npm for basic repository inspection
+and testing. It does
 not provision the official per-instance Docker images, install each repository's
 language dependencies, or run the hidden grading harness. Extend the worker
 image with the dependencies needed for your chosen repositories. This mode
