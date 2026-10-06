@@ -243,8 +243,8 @@ export AGENT_API_KEY=<your-token>
 
 Use the [official dataset](https://huggingface.co/datasets/ScaleAI/SWE-bench_Pro)
 and choose a revision explicitly. The runner resolves tags to a commit SHA and
-records it. Config `default` follows the current public dataset; legacy v1 uses
-`--revision v1.0 --config v1`. Alternatively pass `--dataset-jsonl cases.jsonl`;
+records it. Config `default` follows the current public dataset and is also the
+available config for the `v1.0` revision. Alternatively pass `--dataset-jsonl cases.jsonl`;
 the runner records the file's SHA-256. Select specific cases with repeatable
 `--instance-id`; `--limit 0` runs all selected cases.
 

@@ -156,7 +156,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-jsonl", type=Path)
     parser.add_argument("--revision", help="Pinned Hugging Face dataset commit or tag")
-    parser.add_argument("--config", default="default", help="Dataset config, e.g. default, hard, v1")
+    parser.add_argument("--config", default="default", help="Hugging Face dataset config (default: default)")
     parser.add_argument("--instance-id", action="append")
     parser.add_argument("--limit", type=int, default=1, help="0 runs all selected cases")
     parser.add_argument("--concurrency", type=int, default=2)
