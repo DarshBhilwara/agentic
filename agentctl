@@ -3,6 +3,7 @@ import argparse
 import os
 import sys
 import time
+import json
 import requests
 
 API_GATEWAY = os.getenv("AGENTCTL_GATEWAY_URL", "http://localhost:30080")
@@ -37,7 +38,7 @@ def wait_for_task(task_id):
         status = request("GET", f"/tasks/{task_id}")
         if status["status"] == "completed":
             return status.get("result", "")
-        if status["status"] == "failed":
+        if status["status"] in {"failed", "timeout"}:
             raise RuntimeError(status.get("error", "Unknown agent error"))
         time.sleep(1)
 
@@ -70,11 +71,23 @@ def submit(prompt, watch, location):
     try:
         session = request("POST", "/sessions", params={"workspace": os.path.abspath(location)})
         task = request("POST", f"/sessions/{session['session_id']}/messages", params={"prompt": prompt})
-        print(f"Task {task['task_id']} queued")
+        print(f"Task {task['task_id']} queued (run {task['run_id']})")
         if watch:
             print(wait_for_task(task["task_id"]))
     except (requests.RequestException, RuntimeError) as exc:
         print(f"Connection or agent error: {exc}", file=sys.stderr)
+
+def telemetry(run_id, follow):
+    while True:
+        try:
+            data = request("GET", f"/telemetry/runs/{run_id}")
+            print(json.dumps(data, indent=2))
+            if not follow or data["run"].get("status") in {"completed", "failed", "timeout", "cancelled"}:
+                return
+            time.sleep(2)
+        except requests.RequestException as exc:
+            print(f"Telemetry request failed: {exc}", file=sys.stderr)
+            return
 
 parser = argparse.ArgumentParser(description="Interactive access to the agent backend")
 commands = parser.add_subparsers(dest="command")
@@ -85,10 +98,13 @@ submit_parser.add_argument("prompt")
 submit_parser.add_argument("-w", "--watch", action="store_true")
 submit_parser.add_argument("-C", "--location", default=".", help="Project directory")
 commands.add_parser("chat", help="Start an interactive agent session")
+telemetry_parser = commands.add_parser("telemetry", help="Inspect a durable agent execution ledger")
+telemetry_parser.add_argument("run_id")
+telemetry_parser.add_argument("-f", "--follow", action="store_true")
 chat_parser = commands.choices["chat"]
 chat_parser.add_argument("location", help="Project directory to operate on")
 argv = sys.argv[1:]
-if argv and argv[0] not in {"login", "submit", "chat", "-h", "--help"}:
+if argv and argv[0] not in {"login", "submit", "chat", "telemetry", "-h", "--help"}:
     argv = ["chat", *argv]
 args = parser.parse_args(argv)
 
@@ -98,5 +114,7 @@ elif args.command == "submit":
     submit(args.prompt, args.watch, args.location)
 elif args.command == "chat":
     chat(args.location)
+elif args.command == "telemetry":
+    telemetry(args.run_id, args.follow)
 else:
     parser.print_help()

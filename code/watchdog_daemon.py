@@ -24,7 +24,7 @@ class IngestionHandler(FileSystemEventHandler):
                     out.write(status["result"])
                 os.remove(filepath)
                 break
-            elif status["status"] == "failed":
+            elif status["status"] in {"failed", "timeout"}:
                 os.remove(filepath)
                 break
             time.sleep(2)

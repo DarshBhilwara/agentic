@@ -1,11 +1,53 @@
 import os
 import logging
+import re
+import hashlib
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
 
 def _attribute_value(value):
     return value if isinstance(value, (str, bool, int, float)) else str(value)
+
+
+CONTENT_CAPTURE = os.getenv("AGENT_TELEMETRY_CONTENT_CAPTURE", "redacted").lower()
+_SECRET_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|authorization|bearer|password|secret|token)\s*([:=]|\s)\s*(?:bearer\s+)?[^\s,;]+"
+)
+
+
+def redact_text(value, *, limit=4096):
+    text = _SECRET_PATTERN.sub(r"\1\2[REDACTED]", str(value))
+    return text[:limit] + ("... [truncated]" if len(text) > limit else "")
+
+
+def safe_content(value, *, limit=4096):
+    """Return content according to the configured capture policy.
+
+    full is useful only in a trusted evaluation environment.  Production
+    defaults to redacted capture; off keeps a stable content fingerprint.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    if CONTENT_CAPTURE in ("off", "none", "metadata"):
+        return {"sha256": digest, "length": len(text), "capture": "off"}
+    text = redact_text(text, limit=limit)
+    if CONTENT_CAPTURE == "full":
+        return {"text": text, "sha256": digest, "length": len(str(value)), "capture": "full"}
+    return {"text": text, "sha256": digest, "length": len(str(value)), "capture": "redacted"}
+
+
+def safe_payload(value):
+    """Apply capture policy recursively to an untrusted event payload."""
+    if isinstance(value, str):
+        return safe_content(value)
+    if isinstance(value, dict):
+        return {str(key): safe_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [safe_payload(item) for item in value[:100]]
+    return value
 
 
 try:
@@ -45,6 +87,11 @@ try:
     task_counter = meter.create_counter("agent.tasks.total", description="Agent tasks processed")
     task_error_counter = meter.create_counter("agent.task.errors.total", description="Agent task failures")
     inference_counter = meter.create_counter("agent.inference.requests.total", description="Inference requests")
+    event_counter = meter.create_counter("agent.telemetry.events.total", description="Execution ledger events")
+    handoff_counter = meter.create_counter("agent.handoffs.total", description="Agent handoffs")
+    program_duration = meter.create_histogram("agent.program.duration", unit="ms")
+    program_queue = meter.create_histogram("agent.program.queue.duration", unit="ms")
+    program_steps = meter.create_histogram("agent.program.inference.steps", unit="{step}")
 
 except Exception:
     logging.exception("OpenTelemetry initialization failed; telemetry is disabled")
@@ -60,9 +107,11 @@ except Exception:
 
     class _NoopMetric:
         def add(self, *_args, **_kwargs): return None
+        def record(self, *_args, **_kwargs): return None
 
     tracer = _NoopTracer()
-    task_counter = task_error_counter = inference_counter = _NoopMetric()
+    task_counter = task_error_counter = inference_counter = event_counter = handoff_counter = _NoopMetric()
+    program_duration = program_queue = program_steps = _NoopMetric()
     otel_context = propagate = None
 
 
@@ -82,6 +131,16 @@ def inject_context():
     return carrier
 
 
+def trace_identity():
+    """Expose trace correlation without coupling the ledger to an exporter."""
+    if "trace" not in globals():
+        return {}
+    context = trace.get_current_span().get_span_context()
+    if not context or not context.is_valid:
+        return {}
+    return {"trace.id": format(context.trace_id, "032x"), "span.id": format(context.span_id, "016x")}
+
+
 @contextmanager
 def parent_context(carrier):
     if propagate is None:
@@ -97,12 +156,16 @@ def parent_context(carrier):
 
 @contextmanager
 def intent_span(prompt, *, user, agent_id, session_id, turn_id, turn_number,
-                benchmark=None, case_id=None, model=None):
+                benchmark=None, case_id=None, model=None, run_id=None, agent_run_id=None,
+                parent_agent_run_id=None):
     """Record agent intent with OpenTelemetry GenAI attributes/events."""
     attributes = {
         "gen_ai.operation.name": "invoke_agent",
         "gen_ai.agent.name": os.getenv("OTEL_AGENT_NAME", "enterprise-agent"),
         "agent.id": agent_id,
+        "agent.run.id": agent_run_id or turn_id,
+        "agent.parent.run.id": parent_agent_run_id or "",
+        "run.id": run_id or turn_id,
         "agent.session.id": session_id,
         "gen_ai.conversation.id": session_id,
         "agent.turn.id": turn_id,
@@ -118,7 +181,7 @@ def intent_span(prompt, *, user, agent_id, session_id, turn_id, turn_number,
         attributes["benchmark.case.id"] = case_id
     with span("gen_ai.invoke_agent", **attributes) as current:
         current.add_event("gen_ai.user.message", {
-            "gen_ai.event.content": prompt,
+            "gen_ai.event.content": str(safe_content(prompt)),
             "gen_ai.event.role": "user",
         })
         try:

@@ -2,3 +2,9 @@ k3s-data
 model-cache
 workspace
 __pycache__
+.pytest_cache/
+.venv/
+benchmark-results/
+benchmark-workspaces/
+build/
+*.egg-info/

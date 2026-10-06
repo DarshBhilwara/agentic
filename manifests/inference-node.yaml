@@ -33,19 +33,23 @@ spec:
       runtimeClassName: nvidia
       containers:
       - name: vllm
-        image: vllm/vllm-openai:v0.8.5
+        image: agentic-vllm:0.1
+        imagePullPolicy: IfNotPresent
         command: [sh, -c]
         args:
-        - exec python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-14B-Instruct-AWQ --served-model-name qwen --port 8000 --gpu-memory-utilization 0.92 --enable-auto-tool-choice --tool-call-parser hermes --otlp-traces-endpoint "$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" --collect-detailed-traces all
+        - exec python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-14B-Instruct-AWQ --served-model-name qwen --port 8000 --gpu-memory-utilization 0.92 --enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching --otlp-traces-endpoint "$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" --collect-detailed-traces all
         ports: [{containerPort: 8000}]
         resources: {limits: {nvidia.com/gpu: "1"}, requests: {nvidia.com/gpu: "1"}}
         env:
+        - {name: VLLM_USE_V1, value: "0"}
+        - {name: VLLM_PLUGINS, value: agentic_telemetry}
+        - {name: REDIS_URL, value: "redis://redis-service:6379/0"}
         - {name: HUGGING_FACE_HUB_TOKEN, valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}}
         - {name: OTEL_SERVICE_NAME, value: inference-vllm}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
         volumeMounts: [{name: cache, mountPath: /root/.cache/huggingface}]
-      volumes: [{name: cache, hostPath: {path: /home/iiitd/Documents/agentic/model-cache, type: DirectoryOrCreate}}]
+      volumes: [{name: cache, hostPath: {path: __INFERENCE_CACHE_DIR__, type: DirectoryOrCreate}}]
 ---
 apiVersion: v1
 kind: Service

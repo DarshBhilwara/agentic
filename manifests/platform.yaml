@@ -60,6 +60,7 @@ spec:
         app: otel-node-collector
     spec:
       hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       hostPID: true
       containers:
       - name: otel-collector

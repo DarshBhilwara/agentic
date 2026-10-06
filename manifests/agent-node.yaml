@@ -6,12 +6,12 @@ spec:
   accessModes: [ReadWriteMany]
   persistentVolumeReclaimPolicy: Retain
   storageClassName: agentic-local
-  nfs:
-    server: agent-01
-    path: /home/darsh/research/runn/workspace
+  hostPath:
+    path: __AGENT_BASE_DIR__/workspace
+    type: DirectoryOrCreate
   nodeAffinity:
     required:
-      nodeSelectorTerms: [{matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [agent-01]}]}]
+      nodeSelectorTerms: [{matchExpressions: [{key: agentic.io/role, operator: In, values: [agent]}]}]
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -26,12 +26,27 @@ kind: Deployment
 metadata: {name: redis, namespace: agentic-ai}
 spec:
   replicas: 1
+  strategy: {type: Recreate}
   selector: {matchLabels: {app: redis}}
   template:
     metadata: {labels: {app: redis}}
     spec:
       nodeSelector: {agentic.io/role: agent}
-      containers: [{name: redis, image: redis:7-alpine, ports: [{containerPort: 6379}]}]
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        args: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+        ports: [{containerPort: 6379}]
+        volumeMounts: [{name: data, mountPath: /data}]
+      volumes: [{name: data, persistentVolumeClaim: {claimName: agentic-redis}}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: agentic-redis, namespace: agentic-ai}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: {requests: {storage: 20Gi}}
 ---
 apiVersion: v1
 kind: Service
@@ -53,28 +68,33 @@ spec:
         topologyKey: kubernetes.io/hostname
         whenUnsatisfiable: DoNotSchedule
         labelSelector: {matchLabels: {app: agent-worker}}
-      initContainers: [{name: init-workspace, image: busybox, command: [sh, -c, mkdir -p /workspace/users /workspace/incoming /workspace/processed && chmod -R 777 /workspace], volumeMounts: [{name: workspace, mountPath: /workspace}]}]
+      terminationGracePeriodSeconds: 60
+      initContainers: [{name: init-workspace, image: busybox, command: [sh, -c, mkdir -p /workspace/users /workspace/incoming /workspace/processed], volumeMounts: [{name: workspace, mountPath: /workspace}]}]
       containers:
       - name: worker
-        image: python:3.11-slim
+        image: agentic-worker:0.1
+        imagePullPolicy: IfNotPresent
         workingDir: /app
-        command: [sh, -c, pip install --no-cache-dir redis requests openai opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http && python worker.py]
+        command: [python, worker.py]
         env:
         - {name: AGENT_MODEL_NAME, value: qwen}
         - {name: AGENT_VLLM_URL, value: "http://vllm-service:8000/v1"}
-        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "/home/darsh/research/runn"}
+        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "__AGENT_BASE_DIR__"}
         - {name: AGENT_WORKSPACE_CONTAINER_ROOT, value: "/agent-workspaces"}
         - {name: OTEL_SERVICE_NAME, value: agent-worker}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
-        volumeMounts: [{name: code, mountPath: /app}, {name: workspace, mountPath: /workspace}, {name: agent-workspaces, mountPath: /agent-workspaces}]
-      volumes: [{name: code, hostPath: {path: /home/darsh/research/runn/code}}, {name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}, {name: agent-workspaces, hostPath: {path: /home/darsh/research/runn}}]
+        - {name: AGENT_TELEMETRY_CONTENT_CAPTURE, value: redacted}
+        - {name: AGENT_TELEMETRY_RETENTION_SECONDS, value: "2592000"}
+        - {name: AGENT_TELEMETRY_MAX_EVENTS_PER_RUN, value: "10000"}
+        volumeMounts: [{name: workspace, mountPath: /workspace}, {name: agent-workspaces, mountPath: /agent-workspaces}]
+      volumes: [{name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}, {name: agent-workspaces, hostPath: {path: __AGENT_BASE_DIR__, type: Directory}}]
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: api-gateway, namespace: agentic-ai}
 spec:
-  replicas: 6
+  replicas: 1
   selector: {matchLabels: {app: api-gateway}}
   template:
     metadata: {labels: {app: api-gateway}}
@@ -87,9 +107,10 @@ spec:
         labelSelector: {matchLabels: {app: api-gateway}}
       containers:
       - name: gateway
-        image: python:3.11-slim
+        image: agentic-worker:0.1
+        imagePullPolicy: IfNotPresent
         workingDir: /app
-        command: [sh, -c, pip install --no-cache-dir fastapi uvicorn redis opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http && uvicorn gateway:app --host 0.0.0.0 --port 8000]
+        command: [uvicorn, gateway:app, --host, 0.0.0.0, --port, "8000"]
         env:
         - name: AGENT_API_KEYS
           valueFrom:
@@ -98,13 +119,16 @@ spec:
               key: json
               optional: true
         - {name: OTEL_SERVICE_NAME, value: agent-gateway}
-        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "/home/darsh/research/runn"}
+        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "__AGENT_BASE_DIR__"}
         - {name: AGENT_WORKSPACE_CONTAINER_ROOT, value: "/agent-workspaces"}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
+        - {name: AGENT_TELEMETRY_CONTENT_CAPTURE, value: redacted}
+        - {name: AGENT_TELEMETRY_RETENTION_SECONDS, value: "2592000"}
+        - {name: AGENT_TELEMETRY_MAX_EVENTS_PER_RUN, value: "10000"}
         ports: [{containerPort: 8000}]
-        volumeMounts: [{name: code, mountPath: /app}, {name: agent-workspaces, mountPath: /agent-workspaces}]
-      volumes: [{name: code, hostPath: {path: /home/darsh/research/runn/code}}, {name: agent-workspaces, hostPath: {path: /home/darsh/research/runn}}]
+        volumeMounts: [{name: agent-workspaces, mountPath: /agent-workspaces}]
+      volumes: [{name: agent-workspaces, hostPath: {path: __AGENT_BASE_DIR__, type: Directory}}]
 ---
 apiVersion: v1
 kind: Service
@@ -113,3 +137,19 @@ spec:
   type: NodePort
   selector: {app: api-gateway}
   ports: [{port: 8000, targetPort: 8000, nodePort: 30080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: task-reaper, namespace: agentic-ai}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: task-reaper}}
+  template:
+    metadata: {labels: {app: task-reaper}}
+    spec:
+      nodeSelector: {agentic.io/role: agent}
+      containers:
+      - name: reaper
+        image: agentic-worker:0.1
+        imagePullPolicy: IfNotPresent
+        command: [python, task_reaper.py]

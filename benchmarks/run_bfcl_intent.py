@@ -72,7 +72,9 @@ def main():
                 params={"prompt": prompt_for(case), "benchmark": "bfcl", "case_id": case_id},
                 headers=headers, timeout=30)
             response.raise_for_status()
-            task_id = response.json()["task_id"]
+            submitted = response.json()
+            task_id = submitted["task_id"]
+            run_id = submitted["run_id"]
             while True:
                 status = requests.get(f"{args.gateway_url.rstrip('/')}/tasks/{task_id}",
                                       headers=headers, timeout=30)
@@ -81,12 +83,12 @@ def main():
                 if task["status"] == "completed":
                     result = task.get("result", "")
                     break
-                if task["status"] == "failed":
+                if task["status"] in {"failed", "timeout"}:
                     raise RuntimeError(task.get("error", "unknown backend error"))
                 time.sleep(1)
         except (requests.RequestException, RuntimeError) as exc:
             parser.error(f"BFCL case {case_id} failed through backend: {exc}")
-        print(json.dumps({"id": case_id, "result": result}, ensure_ascii=False), flush=True)
+        print(json.dumps({"id": case_id, "run_id": run_id, "result": result}, ensure_ascii=False), flush=True)
         count += 1
     print(json.dumps({"benchmark": "bfcl", "cases": count, "elapsed_s": round(time.time() - started, 3)}))
 

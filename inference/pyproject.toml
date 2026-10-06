@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-vllm-telemetry"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["redis>=5,<6"]
+
+[project.entry-points."vllm.general_plugins"]
+agentic_telemetry = "agentic_vllm:register"
+
+[tool.setuptools]
+py-modules = ["agentic_vllm"]
