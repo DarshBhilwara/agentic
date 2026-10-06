@@ -241,9 +241,13 @@ def _path(path: str, workspace: str) -> str:
 def workspace_has_changes(workspace: str) -> bool:
     """Return whether a Git workspace has tracked or untracked changes."""
     result = subprocess.run(
-        ["git", "-C", workspace, "status", "--porcelain"],
-        check=True, text=True, capture_output=True, timeout=30,
+        ["git", "-c", f"safe.directory={workspace}", "-C", workspace,
+         "status", "--porcelain"],
+        text=True, capture_output=True, timeout=30,
     )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise RuntimeError(f"Could not inspect workspace changes: {detail}")
     return bool(result.stdout.strip())
 
 
