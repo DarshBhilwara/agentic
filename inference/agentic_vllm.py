@@ -20,7 +20,9 @@ _registered = False
 
 def request_identity(request_id):
     try:
-        program_id, step, nonce = request_id.removeprefix("chatcmpl-").rsplit(".", 2)
+        prefix = "chatcmpl-"
+        value = request_id[len(prefix):] if request_id.startswith(prefix) else request_id
+        program_id, step, nonce = value.rsplit(".", 2)
         return program_id, int(step)
     except (ValueError, AttributeError):
         return None, None
