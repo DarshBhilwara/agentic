@@ -10,6 +10,8 @@ spec:
   template:
     metadata: {labels: {app: nvidia-device-plugin}}
     spec:
+      nodeSelector: {agentic.io/role: inference}
+      runtimeClassName: nvidia
       tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
       containers:
       - name: plugin
@@ -25,6 +27,7 @@ kind: Deployment
 metadata: {name: vllm, namespace: agentic-ai}
 spec:
   replicas: 1
+  strategy: {type: Recreate}
   selector: {matchLabels: {app: vllm}}
   template:
     metadata: {labels: {app: vllm}}

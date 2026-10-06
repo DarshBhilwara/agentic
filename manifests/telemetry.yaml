@@ -133,7 +133,7 @@ metadata:
   name: otel-collector-gateway
   namespace: agentic-ai
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: otel-collector-gateway

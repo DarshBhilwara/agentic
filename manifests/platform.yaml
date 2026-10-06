@@ -23,6 +23,9 @@ spec:
       labels:
         app: nvidia-device-plugin
     spec:
+      nodeSelector:
+        agentic.io/role: inference
+      runtimeClassName: nvidia
       tolerations:
       - key: nvidia.com/gpu
         operator: Exists
