@@ -12,12 +12,12 @@ gateway -> Redis task queue -> worker/agent -> vLLM
    +--------------+----------------+-----------+
                   telemetry
                       |
-          +-----------+----------------+
-          |                            |
-  Redis execution ledger       OpenTelemetry Collector
-   runs, steps, events          traces, logs, metrics
-                                        |
-                               Phoenix and Prometheus
+                      |
+                      |      
+         OpenTelemetry Collector 
+         traces, logs, metrics
+                      |
+            Phoenix and Prometheus
 ```
 
 Telemetry identities that are available at the point of
