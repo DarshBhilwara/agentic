@@ -7,7 +7,7 @@ case "$NODE_ROLE" in
     BASE_DIR="/home/iiitd/Documents/agentic"
     ;;
   agent)
-    BASE_DIR="$(pwd -P)"
+    BASE_DIR="/home/agentic/agentic"
     ;;
   *)
     echo "Usage: $0 {inference|agent}" >&2
@@ -23,11 +23,6 @@ mkdir -p "$BASE_DIR/workspace/incoming" \
          "$BASE_DIR/workspace/users" \
          "$BASE_DIR/manifests" \
          "$BASE_DIR/model-cache"
-
-if [[ "$NODE_ROLE" == "agent" && -f "$BASE_DIR/manifests/agent-node.yaml" ]]; then
-  sed -i "s|__AGENT_BASE_DIR__|$BASE_DIR|g" "$BASE_DIR/manifests/agent-node.yaml"
-  sed -i "s|__AGENT_WORKSPACE_ROOT__|$(dirname "$BASE_DIR")|g" "$BASE_DIR/manifests/agent-node.yaml"
-fi
 
 chmod -R 777 "$BASE_DIR/workspace"
 chmod -R 777 "$BASE_DIR/model-cache"

@@ -20,7 +20,7 @@ def replace(value, substitutions):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent-root", required=True)
+    parser.add_argument("--agent-root", default="/home/agentic/agentic")
     parser.add_argument("--inference-cache", required=True)
     parser.add_argument("--output", type=Path, default=Path("build/manifests"))
     args = parser.parse_args()
@@ -30,7 +30,8 @@ def main():
     if args.output.resolve() == source:
         parser.error("Choose an output directory other than source manifests")
     args.output.mkdir(parents=True, exist_ok=True)
-    substitutions = {"__AGENT_BASE_DIR__": args.agent_root.rstrip("/"),
+    substitutions = {"/home/agentic/agentic": args.agent_root.rstrip("/"),
+                     "__AGENT_BASE_DIR__": args.agent_root.rstrip("/"),
                      "__INFERENCE_CACHE_DIR__": args.inference_cache}
     for path in source.glob("*.yaml"):
         docs = [replace(doc, substitutions) for doc in yaml.safe_load_all(path.read_text())]

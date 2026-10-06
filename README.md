@@ -13,6 +13,10 @@ vLLM runs on the inference node. See [the metric definitions](TELEMETRY.md) and
 events, and generated patches. Benchmark test correctness is recorded separately
 from agent execution status; this runner does not claim an official benchmark score.
 
+The agent node repository and workspace root is `/home/agentic/agentic`. Benchmark
+checkouts default to `/home/agentic/agentic/benchmark-workspaces` and results
+default to `/home/agentic/agentic/benchmark-results`.
+
 ## Architecture
 
 The components are split across manifests:
@@ -70,5 +74,5 @@ Then connect through the agent gateway:
 ```sh
 export AGENTCTL_GATEWAY_URL="http://<agent-host>:30080"
 ./agentctl login <user-token>
-./agentctl /path/to/project
+./agentctl /home/agentic/agentic/<project>
 ```

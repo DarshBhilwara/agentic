@@ -48,7 +48,9 @@ def _now():
 
 def _workspace(path):
     requested = os.path.realpath(path or os.path.join("/workspace", "users"))
-    host_root = os.path.realpath(os.getenv("AGENT_WORKSPACE_HOST_ROOT", ""))
+    host_root = os.path.realpath(
+        os.getenv("AGENT_WORKSPACE_HOST_ROOT", "/home/agentic/agentic")
+    )
     container_root = os.path.realpath(os.getenv("AGENT_WORKSPACE_CONTAINER_ROOT", "/agent-workspaces"))
     if host_root and requested == host_root:
         return container_root

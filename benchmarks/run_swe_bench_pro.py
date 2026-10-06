@@ -18,6 +18,9 @@ from pathlib import Path
 import requests
 
 
+AGENT_PROJECT_ROOT = Path(os.getenv("AGENT_PROJECT_ROOT", "/home/agentic/agentic"))
+
+
 def prompt_for(case):
     # Explicit allowlist: never send patch, test_patch, fail_to_pass,
     # pass_to_pass, or grading scripts to the model.
@@ -161,8 +164,12 @@ def main():
     parser.add_argument("--task-timeout", type=int, default=1800)
     parser.add_argument("--poll-grace", type=int, default=120)
     parser.add_argument("--poll-interval", type=float, default=2)
-    parser.add_argument("--workspace-root", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True, help="New output directory outside agent checkouts")
+    parser.add_argument("--workspace-root", type=Path,
+                        default=AGENT_PROJECT_ROOT / "benchmark-workspaces")
+    parser.add_argument("--output", type=Path,
+                        default=AGENT_PROJECT_ROOT / "benchmark-results" /
+                        time.strftime("swe-pro-%Y%m%d-%H%M%S"),
+                        help="New output directory outside agent checkouts")
     parser.add_argument("--gateway-url", default=os.getenv("AGENTCTL_GATEWAY_URL", "http://localhost:30080"))
     args = parser.parse_args()
     if args.concurrency < 1 or args.limit < 0 or args.poll_interval <= 0:

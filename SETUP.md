@@ -27,13 +27,14 @@ Get the join token on the inference node:
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
-On the agent node, run the same script from the directory that should contain the agent files. This also installs K3s, but does not configure the NVIDIA runtime:
+On the agent node, place this repository at `/home/agentic/agentic`. The setup
+script uses that path and installs K3s, but does not configure the NVIDIA runtime:
 
 ```sh
-cd /path/to/agentic
+cd /home/agentic/agentic
 export K3S_URL="https://<inference-host>:6443"
 export K3S_TOKEN="<token-from-inference-node>"
-/path/to/setup.sh agent
+./setup.sh agent
 ```
 
 The bootstrap script creates the directory anchors. Render deployment paths for
@@ -58,7 +59,7 @@ differ; applying a manifest does not migrate existing ephemeral Redis data.
 
 ## Build and render for the existing two-node cluster
 
-Build both images from this repository root, then make the worker image available
+Build both images from `/home/agentic/agentic`, then make the worker image available
 on the agent node and the vLLM image on the inference node. These are custom
 images: the stock vLLM image alone cannot provide the per-request adapter.
 
@@ -76,13 +77,14 @@ host. Its checkouts must lie under the agent project root mounted into workers.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt -r benchmarks/requirements.txt
 .venv/bin/python scripts/render_manifests.py \
-  --agent-root /absolute/project/root/on/agent-node \
-  --inference-cache /absolute/model-cache/on/inference-node
+  --agent-root /home/agentic/agentic \
+  --inference-cache /home/iiitd/Documents/agentic/model-cache
 ```
 
 This writes `build/manifests/` without accessing a cluster. Ensure the agent root
 exists on the agent host. Review rendered paths and image names before applying.
-The source manifests contain path placeholders and should not be applied directly.
+The agent-node source manifest already targets `/home/agentic/agentic`. Rendering
+is still required to replace the inference-node model-cache placeholder.
 
 ## Credentials
 Configure one API token per user. The token-to-user mapping creates isolated workspaces under `/workspace/users/<user>`:
@@ -167,7 +169,7 @@ Install the client dependency on the client machine:
 python3 -m pip install requests
 export AGENTCTL_GATEWAY_URL="http://<agent-host>:30080"
 ./agentctl login <user-token>
-./agentctl /path/to/project
+./agentctl /home/agentic/agentic/<project>
 ./agentctl list
 ```
 
@@ -235,8 +237,8 @@ export AGENT_API_KEY=<your-token>
 .venv/bin/python benchmarks/run_swe_bench_pro.py \
   --revision <dataset-commit-or-tag> --config default \
   --limit 1 --concurrency 2 --max-steps 100 --task-timeout 1800 \
-  --workspace-root /absolute/project/root/on/agent-node/benchmark-workspaces \
-  --output /absolute/results/swe-pro-experiment-001
+  --workspace-root /home/agentic/agentic/benchmark-workspaces \
+  --output /home/agentic/agentic/benchmark-results/swe-pro-experiment-001
 ```
 
 Use the [official dataset](https://huggingface.co/datasets/ScaleAI/SWE-bench_Pro)

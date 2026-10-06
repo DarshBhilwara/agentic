@@ -7,7 +7,7 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   storageClassName: agentic-local
   hostPath:
-    path: __AGENT_BASE_DIR__/workspace
+    path: /home/agentic/agentic/workspace
     type: DirectoryOrCreate
   nodeAffinity:
     required:
@@ -79,7 +79,7 @@ spec:
         env:
         - {name: AGENT_MODEL_NAME, value: qwen}
         - {name: AGENT_VLLM_URL, value: "http://vllm-service:8000/v1"}
-        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "__AGENT_BASE_DIR__"}
+        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "/home/agentic/agentic"}
         - {name: AGENT_WORKSPACE_CONTAINER_ROOT, value: "/agent-workspaces"}
         - {name: OTEL_SERVICE_NAME, value: agent-worker}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
@@ -88,7 +88,7 @@ spec:
         - {name: AGENT_TELEMETRY_RETENTION_SECONDS, value: "2592000"}
         - {name: AGENT_TELEMETRY_MAX_EVENTS_PER_RUN, value: "10000"}
         volumeMounts: [{name: workspace, mountPath: /workspace}, {name: agent-workspaces, mountPath: /agent-workspaces}]
-      volumes: [{name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}, {name: agent-workspaces, hostPath: {path: __AGENT_BASE_DIR__, type: Directory}}]
+      volumes: [{name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}, {name: agent-workspaces, hostPath: {path: /home/agentic/agentic, type: Directory}}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -119,7 +119,7 @@ spec:
               key: json
               optional: true
         - {name: OTEL_SERVICE_NAME, value: agent-gateway}
-        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "__AGENT_BASE_DIR__"}
+        - {name: AGENT_WORKSPACE_HOST_ROOT, value: "/home/agentic/agentic"}
         - {name: AGENT_WORKSPACE_CONTAINER_ROOT, value: "/agent-workspaces"}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
@@ -128,7 +128,7 @@ spec:
         - {name: AGENT_TELEMETRY_MAX_EVENTS_PER_RUN, value: "10000"}
         ports: [{containerPort: 8000}]
         volumeMounts: [{name: agent-workspaces, mountPath: /agent-workspaces}]
-      volumes: [{name: agent-workspaces, hostPath: {path: __AGENT_BASE_DIR__, type: Directory}}]
+      volumes: [{name: agent-workspaces, hostPath: {path: /home/agentic/agentic, type: Directory}}]
 ---
 apiVersion: v1
 kind: Service
