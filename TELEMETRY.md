@@ -174,3 +174,26 @@ Defaults are 30 days and 10,000 events. Set
 `AGENT_TELEMETRY_CONTENT_CAPTURE=off` for hashes and lengths only,
 `redacted` for masked bounded content, or `full` only in a trusted evaluation
 environment.
+
+## Traces and metrics
+
+OpenTelemetry traces contain correlated  for task submission, complete
+program execution, agent invocation, model inference, and tool execution.
+Trace context is propagated from the gateway through the worker to vLLM.
+Exceptions are attached to the span where they occur. Phoenix receives these
+traces.
+
+The runtime exports these custom metrics to Prometheus through the collector:
+
+- `agent.tasks.total`;
+- `agent.task.errors.total`;
+- `agent.inference.requests.total`;
+- `agent.telemetry.events.total`;
+- `agent.handoffs.total`;
+- `agent.program.duration`;
+- `agent.program.queue.duration`; and
+- `agent.program.inference.steps`.
+
+The collector also scrapes vLLM's native Prometheus endpoint every 15 seconds.
+
+

@@ -20,7 +20,7 @@ gateway -> Redis task queue -> worker/agent -> vLLM
                                Phoenix and Prometheus
 ```
 
-Telemetry is correlated with the identities that are available at the point of
+Telemetry identities that are available at the point of
 collection: `user.id`, `session.id`, `task.id`, `run.id`, `root.run.id`,
 `agent.id`, `agent.run.id`, `agent.parent.run.id`, `handoff.id`, `trace.id`, and
 `span.id`.
@@ -74,12 +74,7 @@ The vLLM adapter adds per-request engine measurements:
 | `inference_queue_time_ms` | Initial scheduling wait inside vLLM |
 | `kv_recomputed_tokens` | Reusable full prefix-cache tokens unavailable at admission |
 
-Model spans and events also record the model name, finish reason, request
-failure type, and client-observed latency. `step_t_reasoning_ms` is a timing
-measurement; it does not contain private model reasoning or chain-of-thought.
-
-Engine timing is joined to the step using the exact request ID. Missing, late,
-or dropped measurements remain `null`. Batch-attributed GPU time is not
+Batch-attributed GPU time is not
 exclusive per-request GPU occupancy and must not be summed across concurrent
 programs to estimate physical GPU utilization.
 
@@ -116,14 +111,9 @@ Successful `read_file` and `write_file` calls also produce `artifact.read` and
 `artifact.written` events. The worker produces an `artifact.written` event for
 the final task-result file.
 
-## Multi-agent telemetry
 
-Delegation records the parent and child task/run relationship, target agent
-identity and name, handoff ID, shared root-run ID, and a bounded delegated-task
-description. This permits reconstruction of the dynamic agent tree without
-requiring a predefined workflow graph.
 
-## Execution-ledger events
+## Execution events
 
 The native runtime currently emits events in these categories:
 
@@ -141,61 +131,3 @@ The native runtime currently emits events in these categories:
 External runtimes can append compatible or namespaced events through the
 authenticated telemetry API.
 
-## Traces and metrics
-
-OpenTelemetry traces contain correlated spans for task submission, complete
-program execution, agent invocation, model inference, and tool execution.
-Trace context is propagated from the gateway through the worker to vLLM.
-Exceptions are attached to the span where they occur. Phoenix receives these
-traces.
-
-The runtime exports these custom metrics to Prometheus through the collector:
-
-- `agent.tasks.total`;
-- `agent.task.errors.total`;
-- `agent.inference.requests.total`;
-- `agent.telemetry.events.total`;
-- `agent.handoffs.total`;
-- `agent.program.duration`;
-- `agent.program.queue.duration`; and
-- `agent.program.inference.steps`.
-
-The collector also scrapes vLLM's native Prometheus endpoint every 15 seconds.
-
-## Host and process telemetry
-
-An OpenTelemetry Collector runs on every node and collects the following every
-10 seconds:
-
-- CPU and system load;
-- memory;
-- network interfaces;
-- disks and filesystems;
-- individual process measurements; and
-- process counts and states.
-
-The measurements include the host and Kubernetes node identity so agent-node
-and inference-node behavior can be separated.
-
-## Storage, retention, and content capture
-
-| Destination | Data |
-| --- | --- |
-| Redis | Durable run metadata, program summaries, per-step records, and events |
-| Phoenix | Correlated OpenTelemetry traces |
-| Prometheus | Application, host, process, and native vLLM metrics |
-| Collector debug exporter | Received OTLP logs |
-
-The Redis ledger defaults to 30-day retention and keeps the latest 10,000
-events per run. Step records and summaries are stored separately from the
-bounded event tail.
-
-Content capture is controlled by `AGENT_TELEMETRY_CONTENT_CAPTURE`:
-
-- `off`: retain hashes and lengths instead of content;
-- `redacted`: mask likely credentials and bound captured content (default); or
-- `full`: retain bounded content, intended only for trusted evaluation systems.
-
-Unknown measurements are represented as JSON `null`, never fabricated zeroes.
-If the deadline reaper finalizes an abandoned worker, unrecoverable partial
-durations remain unknown and the summary records `timing_complete=false`.
