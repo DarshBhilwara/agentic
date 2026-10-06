@@ -238,6 +238,15 @@ def _path(path: str, workspace: str) -> str:
     return candidate
 
 
+def workspace_has_changes(workspace: str) -> bool:
+    """Return whether a Git workspace has tracked or untracked changes."""
+    result = subprocess.run(
+        ["git", "-C", workspace, "status", "--porcelain"],
+        check=True, text=True, capture_output=True, timeout=30,
+    )
+    return bool(result.stdout.strip())
+
+
 def execute_command(args: Dict, workspace: str) -> str:
     command = (args or {}).get("command", "")
     if not command:
@@ -511,7 +520,7 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
         case_id=None, task_id="standalone", run_id=None, root_run_id=None,
         agent_run_id=None, parent_agent_run_id=None, agent_name="enterprise-agent",
         event_sink=None, redis_client=None, measurements=None, max_steps=100,
-        timeout_seconds=1800, enabled_tools=None):
+        timeout_seconds=1800, enabled_tools=None, require_workspace_changes=False):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", user):
         raise ValueError("invalid user identity")
     workspace = workspace or os.path.join("/workspace/users", user)
@@ -533,6 +542,7 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
     tools = [tool for tool in TOOLS if enabled_tools is None or tool["function"]["name"] in enabled_tools]
     messages: List[Dict] = list(conversation) if conversation else [{"role": "system", "content": SYSTEM_PROMPT.format(workspace=workspace)}]
     messages.append({"role": "user", "content": prompt})
+    rejected_completions = 0
     try:
         with intent_span(prompt, user=user, agent_id=agent_id, session_id=session_id,
                      turn_id=turn_id, turn_number=turn_number, benchmark=benchmark,
@@ -584,6 +594,23 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
                     if response.choices[0].finish_reason == "length":
                         raise RuntimeError("Model response truncated by token limit")
                     if not calls:
+                        if require_workspace_changes and not workspace_has_changes(workspace):
+                            rejected_completions += 1
+                            _emit("agent.completion.rejected", attributes={
+                                **attrs, "reason": "workspace_unchanged",
+                                "rejected_completions": rejected_completions,
+                            }, severity="error")
+                            if rejected_completions >= 2:
+                                raise RuntimeError("Coding task completed without making workspace changes")
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "No workspace changes were detected, so the coding task is not complete. "
+                                    "Continue inspecting the repository and make the required changes. Do not "
+                                    "describe changes unless you actually apply them."
+                                ),
+                            })
+                            continue
                         _emit("agent.completed", attributes=attrs)
                         return message.content or "", messages
                     acting_started = time.perf_counter()

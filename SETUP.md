@@ -253,7 +253,9 @@ session, and a unique program/run ID. Only the problem statement, requirements,
 and interfaces enter the prompt. No dataset reference patch or hidden test
 metadata is passed to the agent. Checkout time is reported as `setup_time_ms`,
 separate from program execution time. Coding-only mode disables delegation,
-search, and calculator tools for these runs.
+search, and calculator tools for these runs. It also rejects a terminal model
+answer when the Git workspace is unchanged, gives the model one explicit retry,
+and fails the task if the retry still produces no change.
 
 Outputs:
 

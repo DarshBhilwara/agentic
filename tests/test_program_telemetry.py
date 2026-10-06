@@ -104,6 +104,23 @@ def test_missing_token_usage_is_unknown(tmp_path, fake_model):
     assert measured.summary()["total_prompt_tokens"] is None
 
 
+def test_coding_task_without_changes_is_rejected(tmp_path, fake_model):
+    import subprocess
+    subprocess.run(["git", "-C", str(tmp_path), "init"], check=True, capture_output=True)
+    (tmp_path / "README").write_text("fixture")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True, capture_output=True)
+    subprocess.run([
+        "git", "-C", str(tmp_path), "-c", "user.name=Test", "-c",
+        "user.email=test@example.com", "commit", "-m", "base",
+    ], check=True, capture_output=True)
+    fake_model.side_effect = [completion(), completion()]
+    measured = ProgramTelemetry("p")
+    with pytest.raises(RuntimeError, match="without making workspace changes"):
+        agent.run("fix", "alice", workspace=str(tmp_path), measurements=measured,
+                  require_workspace_changes=True)
+    assert len(measured.steps) == 2
+
+
 def test_request_join_does_not_mix_concurrent_programs():
     r = fakeredis.FakeRedis()
     r.set("telemetry:inference:A", json.dumps({"prefill_time_ms": 12, "kv_recomputed_tokens": 0}))

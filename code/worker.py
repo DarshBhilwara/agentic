@@ -83,7 +83,8 @@ def process_task(r, task_id):
                         agent_name=task.get("agent_name", "enterprise-agent"), event_sink=emit,
                         redis_client=r, measurements=measurements,
                         max_steps=int(task.get("max_steps", 100)), timeout_seconds=timeout_seconds,
-                        enabled_tools=json.loads(task["enabled_tools"]) if task.get("enabled_tools") else None)
+                        enabled_tools=json.loads(task["enabled_tools"]) if task.get("enabled_tools") else None,
+                        require_workspace_changes=task.get("require_workspace_changes") == "1")
                     r.set(conversation_key, json.dumps(conversation), ex=2592000)
                     artifact_dir = os.path.join(os.getenv("AGENT_RESULTS_ROOT", "/workspace/users"), user)
                     os.makedirs(artifact_dir, exist_ok=True)
