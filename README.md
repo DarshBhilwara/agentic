@@ -6,8 +6,9 @@ The current experiment is **program-level agent telemetry on SWE-bench Pro**:
 one dataset instance attempt is one program, with inference-step counts,
 submission-to-completion time, queue wait, tool timings/statuses, context size,
 and inference-node timing/cache measurements. The agent runs on the agent node;
-vLLM runs on the inference node. See [the metric definitions](TELEMETRY.md) and
-[the benchmark instructions](SETUP.md#swe-bench-pro-program-traces).
+vLLM runs on the inference node. See the [collected telemetry inventory](COLLECTED_TELEMETRY.md),
+[metric definitions](TELEMETRY.md), and
+[benchmark instructions](SETUP.md#swe-bench-pro-program-traces).
 
 `benchmarks/run_swe_bench_pro.py` exports `programs.jsonl`, per-program steps and
 events, and generated patches. Benchmark test correctness is recorded separately
