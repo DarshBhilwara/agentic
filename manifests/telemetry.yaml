@@ -5,6 +5,8 @@ metadata:
   namespace: agentic-ai
 data:
   config.yaml: |
+    extensions:
+      file_storage/queue: {directory: /var/lib/otelcol/queue}
     receivers:
       otlp:
         protocols:
@@ -33,12 +35,19 @@ data:
         endpoint: phoenix-svc:4317
         tls:
           insecure: true
+        sending_queue: {enabled: true, queue_size: 1000, storage: file_storage/queue}
+        retry_on_failure: {enabled: true, max_elapsed_time: 300s}
       prometheusremotewrite:
         endpoint: http://prometheus-svc:9090/api/v1/write
-      debug:
-        verbosity: basic
+        sending_queue: {enabled: true, queue_size: 1000, storage: file_storage/queue}
+        retry_on_failure: {enabled: true, max_elapsed_time: 300s}
+      loki:
+        endpoint: http://loki-svc:3100/loki/api/v1/push
+        sending_queue: {enabled: true, queue_size: 1000, storage: file_storage/queue}
+        retry_on_failure: {enabled: true, max_elapsed_time: 300s}
 
     service:
+      extensions: [file_storage/queue]
       pipelines:
         traces:
           receivers: [otlp]
@@ -47,7 +56,7 @@ data:
         logs:
           receivers: [otlp]
           processors: [resource, batch]
-          exporters: [debug]
+          exporters: [loki]
         metrics:
           receivers: [otlp, prometheus]
           processors: [resource, batch]
@@ -127,6 +136,48 @@ spec:
     port: 4318
     targetPort: 4318
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: otel-collector-queue, namespace: agentic-ai}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: {requests: {storage: 2Gi}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: loki-data, namespace: agentic-ai}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: {requests: {storage: 20Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: loki-svc, namespace: agentic-ai}
+spec:
+  selector: {app: loki}
+  ports: [{name: http, port: 3100, targetPort: 3100}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: loki, namespace: agentic-ai}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: loki}}
+  template:
+    metadata: {labels: {app: loki}}
+    spec:
+      nodeSelector: {agentic.io/role: agent}
+      containers:
+      - name: loki
+        image: grafana/loki:3.3.2
+        args: [-config.file=/etc/loki/local-config.yaml]
+        ports: [{containerPort: 3100}]
+        volumeMounts: [{name: data, mountPath: /tmp/loki}]
+      volumes: [{name: data, persistentVolumeClaim: {claimName: loki-data}}]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -153,10 +204,14 @@ spec:
         - {name: otlp-http, containerPort: 4318}
         volumeMounts:
         - {name: config, mountPath: /etc/otelcol-contrib}
+        - {name: queue, mountPath: /var/lib/otelcol/queue}
       volumes:
       - name: config
         configMap:
           name: otel-collector-gateway-config
+      - name: queue
+        persistentVolumeClaim:
+          claimName: otel-collector-queue
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -84,7 +84,8 @@ spec:
         - {name: OTEL_SERVICE_NAME, value: agent-worker}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
-        - {name: AGENT_TELEMETRY_CONTENT_CAPTURE, value: redacted}
+        - {name: OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, value: "http://otel-collector:4318/v1/logs"}
+        - {name: AGENT_TELEMETRY_CONTENT_CAPTURE, value: full}
         - {name: AGENT_TELEMETRY_RETENTION_SECONDS, value: "2592000"}
         - {name: AGENT_TELEMETRY_MAX_EVENTS_PER_RUN, value: "10000"}
         volumeMounts: [{name: workspace, mountPath: /workspace}, {name: agent-workspaces, mountPath: /agent-workspaces}]
@@ -123,7 +124,8 @@ spec:
         - {name: AGENT_WORKSPACE_CONTAINER_ROOT, value: "/agent-workspaces"}
         - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
         - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
-        - {name: AGENT_TELEMETRY_CONTENT_CAPTURE, value: redacted}
+        - {name: OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, value: "http://otel-collector:4318/v1/logs"}
+        - {name: AGENT_TELEMETRY_CONTENT_CAPTURE, value: full}
         - {name: AGENT_TELEMETRY_RETENTION_SECONDS, value: "2592000"}
         - {name: AGENT_TELEMETRY_MAX_EVENTS_PER_RUN, value: "10000"}
         ports: [{containerPort: 8000}]
@@ -153,3 +155,9 @@ spec:
         image: agentic-worker:0.1
         imagePullPolicy: IfNotPresent
         command: [python, task_reaper.py]
+        env:
+        - {name: OTEL_SERVICE_NAME, value: task-reaper}
+        - {name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, value: "http://otel-collector:4318/v1/traces"}
+        - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://otel-collector:4318/v1/metrics"}
+        - {name: OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, value: "http://otel-collector:4318/v1/logs"}
+        - {name: AGENT_TELEMETRY_CONTENT_CAPTURE, value: full}

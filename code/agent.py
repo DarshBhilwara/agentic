@@ -4,18 +4,42 @@ import os
 import re
 import subprocess
 import signal
+import sys
 import time
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Literal, TypedDict
 import requests
+from langgraph.graph import END, START, StateGraph
 from openai import OpenAI, APITimeoutError
-from telemetry import event_counter, handoff_counter, inference_counter, inject_context, intent_span, safe_content, span, trace_identity
+from telemetry import (event_counter, handoff_counter, inference_counter, inject_context,
+                       intent_span, safe_content, safe_payload, span, trace_identity,
+                       tool_calls as tool_call_metric, tool_duration, tool_wait)
 from program_telemetry import ProgramTelemetry, TaskTimeout, StepLimitExceeded, collect_engine_metrics
+from telemetry_ledger import TelemetryLedger
 
 MODEL_NAME = os.getenv("AGENT_MODEL_NAME", "qwen")
-VLLM_URL = os.getenv("AGENT_VLLM_URL", "http://vllm-service:8000/v1")
+DEFAULT_VLLM_URL = "http://vllm-service:8000/v1"
+
+
+def vllm_url() -> str:
+    """Return the configured OpenAI-compatible inference endpoint.
+
+    ``AGENT_VLLM_URL_FILE`` supports a mounted Kubernetes ConfigMap and is
+    read for every agent run. ``AGENT_VLLM_URL`` preserves the existing
+    deployment and local-development configuration.
+    """
+    config_path = os.getenv("AGENT_VLLM_URL_FILE")
+    if config_path:
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                configured = config_file.read().strip()
+        except OSError:
+            configured = ""
+        if configured:
+            return configured
+    return os.getenv("AGENT_VLLM_URL", DEFAULT_VLLM_URL)
 SYSTEM_PROMPT = """You are the enterprise agent running in the agent node.f
 You help with research, information lookup, file and workspace management, and
 general task execution using the tools available to you.
@@ -141,6 +165,9 @@ def _emit(event_type, *, attributes=None, payload=None, severity="info", **extra
         attributes={"program_id": context["task_id"], **(attributes or {})},
         payload=payload,
         severity=severity,
+        **{"root.run.id": context.get("root_run_id", context.get("run_id")),
+           "parent.task.id": context.get("parent_task_id", ""),
+           "parent.run.id": context.get("parent_run_id", context.get("parent_agent_run_id", ""))},
         **trace_identity(),
         **extra,
     )
@@ -405,7 +432,10 @@ def delegate_to_agent(args: Dict, _workspace: str) -> str:
     child_agent_id = str(uuid.uuid4())
     child_agent_run_id = str(uuid.uuid4())
     child_run_id = str(uuid.uuid4())
+    handoff_id = str(uuid.uuid4())
     redis_client = context["redis"]
+    TelemetryLedger(redis_client).link_delegation(context["run_id"], child_run_id,
+                                                   context["user"], handoff_id)
     redis_client.hset(f"task:{child_task_id}", mapping={
         "id": child_task_id,
         "user": context["user"],
@@ -417,6 +447,8 @@ def delegate_to_agent(args: Dict, _workspace: str) -> str:
         "agent_run_id": child_agent_run_id,
         "parent_agent_run_id": context["agent_run_id"],
         "parent_task_id": context["task_id"],
+        "parent_run_id": context["run_id"],
+        "handoff_id": handoff_id,
         "run_id": child_run_id,
         "root_run_id": context["root_run_id"],
         "workspace": context["workspace"],
@@ -437,9 +469,18 @@ def delegate_to_agent(args: Dict, _workspace: str) -> str:
         "agent.delegated",
         attributes={"handoff.to": child_agent_id, "agent.target.name": name},
         payload={"task": safe_content(task), "child_task_id": child_task_id},
-        **{"handoff.id": str(uuid.uuid4()), "child.run.id": child_run_id,
+        **{"handoff.id": handoff_id, "child.run.id": child_run_id,
            "child.agent.run.id": child_agent_run_id},
     )
+    _emit("procedural_graph.observed", attributes={
+        "node": f"delegation:{child_run_id}",
+        "previous_node": f"run:{context['run_id']}",
+        "action": "delegation.handoff"},
+        payload={"parent_run_id": context["run_id"], "child_run_id": child_run_id,
+                 "handoff_id": handoff_id})
+    _emit("agent.handoff.queued", attributes={"handoff.id": handoff_id,
+          "child.task.id": child_task_id, "child.run.id": child_run_id},
+          payload={"parent_task_id": context["task_id"], "parent_run_id": context["run_id"]})
     return json.dumps({"task_id": child_task_id, "agent_id": child_agent_id, "agent_name": name, "status": "queued"})
 
 
@@ -452,6 +493,9 @@ def check_delegated_task(args: Dict, _workspace: str) -> str:
     if not task or task.get(b"user", b"").decode() != context["user"]:
         return "Error: delegated task not found."
     result = {key.decode(): value.decode() for key, value in task.items()}
+    _emit("agent.handoff.checked", attributes={
+        "handoff.id": result.get("handoff_id", ""), "child.task.id": task_id,
+        "child.run.id": result.get("run_id", ""), "child.status": result.get("status", "")})
     return json.dumps({key: result.get(key, "") for key in ("id", "status", "result", "error", "agent_id", "agent_name")})
 
 
@@ -519,10 +563,242 @@ def intent_decision(tool_names):
     }
 
 
+class AgentGraphState(TypedDict):
+    """Explicit state passed between the model and tool graph nodes."""
+
+    messages: List[Dict]
+    step_index: int
+    tool_calls: List[Dict[str, str]]
+    route: Literal["model", "tools", "end"]
+    result: str
+
+
+def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
+                       max_steps, require_workspace_changes, turn_span):
+    """Build the model -> tools -> model LangGraph workflow for one agent run.
+
+    Runtime dependencies stay in this closure rather than graph state, keeping
+    the state explicit and serializable for a future durable checkpointer.
+    """
+    active_step = {"manager": None, "record": None}
+    rejected_completions = {"count": 0}
+
+    def close_step(exc_info=(None, None, None)):
+        manager = active_step["manager"]
+        if manager is not None:
+            active_step["manager"] = None
+            active_step["record"] = None
+            manager.__exit__(*exc_info)
+
+    def call_model(state: AgentGraphState):
+        step_index = state["step_index"] + 1
+        if step_index > max_steps:
+            raise StepLimitExceeded(f"Agent reached the limit of {max_steps} inference steps")
+        manager = measurements.step(step_index)
+        record = manager.__enter__()
+        active_step["manager"] = manager
+        active_step["record"] = record
+        request_id = f"{measurements.program_id}.{step_index}.{uuid.uuid4().hex}"
+        record.request_id = "chatcmpl-" + request_id
+        # Canonical procedure/subgraph IDs are materialized from observed
+        # action windows by the ledger; do not stamp a constant topology ID.
+        record.procedure_id = None
+        record.subgraph_id = None
+        previous_node = "tools" if state.get("step_index") else "START"
+        _emit("procedural_graph.observed", attributes={
+            "node": f"model:{step_index}", "previous_node": previous_node,
+            "action": "model.request", "validation": {"allowed": ["model->tools", "model->model", "model->END"]}})
+        _emit("agent.phase.transition", attributes={"program_id": measurements.program_id,
+              "step_index": step_index, "phase": "reasoning", "phase_status": "started",
+              "procedure.id": record.procedure_id, "subgraph.id": record.subgraph_id})
+        attrs = {"program_id": measurements.program_id, "step_index": step_index,
+                 "agent.step.number": step_index, "request_id": record.request_id}
+        node_span = span("langgraph.node.model", **{"openinference.span.kind": "CHAIN", **attrs})
+        node_span.__enter__()
+        _emit("langgraph.node.started", attributes={**attrs, "graph.node": "model"})
+        node_exc_info = (None, None, None)
+        try:
+            with span("agent.inference", model=MODEL_NAME,
+                      **{"openinference.span.kind": "LLM",
+                         "llm.model_name": MODEL_NAME, **attrs}) as inference_span:
+                inference_counter.add(1, {"model": MODEL_NAME})
+                request_messages = state["messages"]
+                _emit("model.requested", attributes=attrs,
+                      payload={"messages": safe_payload(request_messages)})
+                if os.getenv("AGENT_TELEMETRY_CONTENT_CAPTURE", "redacted").lower() == "full":
+                    inference_span.add_event("gen_ai.request.messages", {
+                        "messages": json.dumps(request_messages, default=str, separators=(",", ":"))
+                    })
+                started = time.perf_counter()
+                try:
+                    response = client.chat.completions.create(
+                        model=MODEL_NAME, messages=state["messages"], tools=tools or None,
+                        tool_choice="auto" if tools else None, max_tokens=4096, temperature=0.1,
+                        extra_headers={**inject_context(), "X-Request-Id": request_id})
+                except APITimeoutError as exc:
+                    _emit("model.failed", attributes={**attrs, "error.type": type(exc).__name__}, severity="error")
+                    raise TaskTimeout("Inference request timed out") from exc
+                except Exception as exc:
+                    _emit("model.failed", attributes={**attrs, "error.type": type(exc).__name__}, severity="error")
+                    raise
+                finally:
+                    record.llm_inference_time_ms = (time.perf_counter() - started) * 1000
+                usage = response.usage
+                record.prompt_tokens = getattr(usage, "prompt_tokens", None)
+                record.completion_tokens = getattr(usage, "completion_tokens", None)
+                if record.prompt_tokens is not None and record.completion_tokens is not None:
+                    record.context_tokens = record.prompt_tokens + record.completion_tokens
+                # Phoenix/OpenInference uses these stable attributes for its
+                # native LLM view. Keep them bounded numeric values; full
+                # messages remain span events in research capture mode.
+                inference_span.set_attribute("llm.token_count.prompt", record.prompt_tokens)
+                inference_span.set_attribute("llm.token_count.completion", record.completion_tokens)
+                inference_span.set_attribute("llm.token_count.total", record.context_tokens)
+                inference_span.set_attribute("gen_ai.usage.input_tokens", record.prompt_tokens)
+                inference_span.set_attribute("gen_ai.usage.output_tokens", record.completion_tokens)
+                inference_span.set_attribute("gen_ai.usage.total_tokens", record.context_tokens)
+                collect_engine_metrics(redis_client, record.request_id, record)
+                message = response.choices[0].message
+                calls = message.tool_calls or []
+                tool_calls = [{"id": call.id, "name": call.function.name,
+                               "arguments": call.function.arguments} for call in calls]
+                decision = intent_decision([call["name"] for call in tool_calls])
+                for key, value in decision.items():
+                    value = json.dumps(value) if isinstance(value, list) else value
+                    inference_span.set_attribute("agent.intent." + key, value)
+                    turn_span.set_attribute("agent.intent." + key, value)
+                _emit("model.completed", attributes={**attrs,
+                      "llm_inference_time_ms": record.llm_inference_time_ms,
+                      "context_tokens": record.context_tokens,
+                      "finish_reason": response.choices[0].finish_reason},
+                      payload={"response": safe_content(message.content or "")})
+                if os.getenv("AGENT_TELEMETRY_CONTENT_CAPTURE", "redacted").lower() == "full":
+                    inference_span.add_event("gen_ai.response.message", {
+                        "message": json.dumps(message.model_dump(exclude_none=True), default=str,
+                                               separators=(",", ":"))
+                    })
+
+            messages = [*state["messages"], message.model_dump(exclude_none=True)]
+            if response.choices[0].finish_reason == "length":
+                raise RuntimeError("Model response truncated by token limit")
+            if calls:
+                _emit("procedural_graph.observed", attributes={"node": f"tools:{step_index}",
+                      "previous_node": f"model:{step_index}", "action": "tool.dispatch"})
+                record.actual_transition = "model->tools"
+                record.expected_transition = "model->tools"
+                record.constraint_violation = False
+                _emit("agent.phase.transition", attributes={"program_id": record.program_id,
+                      "step_index": step_index, "phase": "reasoning", "phase_status": "ended"})
+                return {"messages": messages, "step_index": step_index,
+                        "tool_calls": tool_calls, "route": "tools"}
+            if require_workspace_changes and not workspace_has_changes(workspace):
+                rejected_completions["count"] += 1
+                record.actual_transition = "model->model"
+                record.expected_transition = "model->end"
+                record.constraint_violation = True
+                _emit("agent.phase.transition", attributes={"program_id": record.program_id,
+                      "step_index": step_index, "phase": "reasoning", "phase_status": "ended",
+                      "constraint_violation": True})
+                _emit("agent.completion.rejected", attributes={
+                    **attrs, "reason": "workspace_unchanged",
+                    "rejected_completions": rejected_completions["count"],
+                }, severity="error")
+                close_step()
+                if rejected_completions["count"] >= 2:
+                    raise RuntimeError("Coding task completed without making workspace changes")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "No workspace changes were detected, so the coding task is not complete. "
+                        "Continue inspecting the repository and make the required changes. Do not "
+                        "describe changes unless you actually apply them."
+                    ),
+                })
+                return {"messages": messages, "step_index": step_index,
+                        "tool_calls": [], "route": "model"}
+            result = message.content or ""
+            _emit("procedural_graph.observed", attributes={"node": "END",
+                  "previous_node": f"model:{step_index}", "action": "terminal.success"})
+            record.actual_transition = "model->end"
+            record.expected_transition = "model->end"
+            record.constraint_violation = False
+            _emit("agent.phase.transition", attributes={"program_id": record.program_id,
+                  "step_index": step_index, "phase": "reasoning", "phase_status": "ended"})
+            _emit("agent.completed", attributes=attrs)
+            close_step()
+            return {"messages": messages, "step_index": step_index,
+                    "tool_calls": [], "result": result, "route": "end"}
+        except BaseException as exc:
+            node_exc_info = sys.exc_info()
+            _emit("langgraph.node.error", attributes={**attrs, "graph.node": "model",
+                  "error.type": type(exc).__name__}, severity="error")
+            close_step(sys.exc_info())
+            raise
+        finally:
+            _emit("langgraph.node.ended", attributes={**attrs, "graph.node": "model",
+                  "status": "terminal"})
+            node_span.__exit__(*node_exc_info)
+
+    def execute_tools(state: AgentGraphState):
+        record = active_step["record"]
+        if record is None:
+            raise RuntimeError("LangGraph tools node reached without an active model step")
+        messages = list(state["messages"])
+        acting_started = time.perf_counter()
+        _emit("agent.phase.transition", attributes={"program_id": record.program_id,
+              "step_index": record.step_index, "phase": "tool_wait", "phase_status": "started"})
+        node_attrs = {"graph.node": "tools", "step_index": state["step_index"],
+                      "tool_count": len(state["tool_calls"])}
+        try:
+          with span("langgraph.node.tools", **{"openinference.span.kind": "CHAIN", **node_attrs}):
+            _emit("langgraph.node.started", attributes=node_attrs)
+            try:
+              for tool_index, call in enumerate(state["tool_calls"], 1):
+                  _emit("procedural_graph.observed", attributes={
+                        "node": f"tool:{call['name']}:{record.step_index}:{tool_index}",
+                        "previous_node": f"tools:{record.step_index}",
+                        "action": f"tool.invoke:{call['name']}"})
+                  _emit("agent.phase.transition", attributes={"program_id": record.program_id,
+                        "step_index": record.step_index, "phase": "tool_running",
+                        "tool_name": call["name"], "phase_status": "started"})
+                  result = _execute_tool(call, workspace, record, tools, tool_index=tool_index,
+                                         step_acting_started=acting_started)
+                  messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+            except BaseException as exc:
+              _emit("langgraph.node.error", attributes={**node_attrs, "error.type": type(exc).__name__}, severity="error")
+              raise
+            finally:
+              _emit("langgraph.node.ended", attributes={**node_attrs, "status": "terminal"})
+        except BaseException:
+            close_step(sys.exc_info())
+            raise
+        record.step_t_acting_ms = (time.perf_counter() - acting_started) * 1000
+        _emit("agent.phase.transition", attributes={"program_id": record.program_id,
+              "step_index": record.step_index, "phase": "tool_wait", "phase_status": "ended",
+              "acting_time_ms": record.step_t_acting_ms,
+              "idleness_ratio": record.step_t_acting_ms / max(record.step_t_acting_ms + record.llm_inference_time_ms, 1)})
+        close_step()
+        return {"messages": messages, "tool_calls": [], "route": "model"}
+
+    def route_after_model(state: AgentGraphState):
+        return state["route"]
+
+    graph = StateGraph(AgentGraphState)
+    graph.add_node("model", call_model)
+    graph.add_node("tools", execute_tools)
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", route_after_model,
+                                {"model": "model", "tools": "tools", "end": END})
+    graph.add_edge("tools", "model")
+    return graph.compile(), close_step
+
+
 def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agent_id="standalone",
         turn_id="standalone", turn_number=1, conversation=None, benchmark=None,
         case_id=None, task_id="standalone", run_id=None, root_run_id=None,
-        agent_run_id=None, parent_agent_run_id=None, agent_name="enterprise-agent",
+        agent_run_id=None, parent_agent_run_id=None, parent_task_id=None, parent_run_id=None,
+        handoff_id=None,
+        agent_name="enterprise-agent",
         event_sink=None, redis_client=None, measurements=None, max_steps=100,
         timeout_seconds=1800, enabled_tools=None, require_workspace_changes=False):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", user):
@@ -531,7 +807,7 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
     workspace = os.path.realpath(workspace)
     if not os.path.isdir(workspace):
         raise ValueError(f"workspace does not exist: {workspace}")
-    client = OpenAI(base_url=VLLM_URL, api_key="EMPTY", max_retries=0,
+    client = OpenAI(base_url=vllm_url(), api_key="EMPTY", max_retries=0,
                     timeout=float(os.getenv("AGENT_INFERENCE_TIMEOUT_SECONDS", "300")))
     run_id = run_id or str(uuid.uuid4())
     agent_run_id = agent_run_id or str(uuid.uuid4())
@@ -539,6 +815,8 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
         "user": user, "workspace": workspace, "session_id": session_id,
         "task_id": task_id, "run_id": run_id, "root_run_id": root_run_id or run_id,
         "agent_id": agent_id, "agent_run_id": agent_run_id,
+        "parent_task_id": parent_task_id, "parent_run_id": parent_run_id or parent_agent_run_id,
+        "handoff_id": handoff_id or "",
         "turn_number": turn_number, "event_sink": event_sink, "redis": redis_client,
         "timeout_seconds": timeout_seconds, "max_steps": max_steps,
     })
@@ -546,105 +824,80 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
     tools = [tool for tool in TOOLS if enabled_tools is None or tool["function"]["name"] in enabled_tools]
     messages: List[Dict] = list(conversation) if conversation else [{"role": "system", "content": SYSTEM_PROMPT.format(workspace=workspace)}]
     messages.append({"role": "user", "content": prompt})
-    rejected_completions = 0
     try:
         with intent_span(prompt, user=user, agent_id=agent_id, session_id=session_id,
                      turn_id=turn_id, turn_number=turn_number, benchmark=benchmark,
                      case_id=case_id, model=MODEL_NAME, run_id=run_id,
                      agent_run_id=agent_run_id, parent_agent_run_id=parent_agent_run_id) as turn_span:
             _emit("agent.started", attributes={"agent.name": agent_name, "model.name": MODEL_NAME})
-            for step_index in range(1, max_steps + 1):
-                with measurements.step(step_index) as record:
-                    request_id = f"{measurements.program_id}.{step_index}.{uuid.uuid4().hex}"
-                    record.request_id = "chatcmpl-" + request_id
-                    attrs = {"program_id": measurements.program_id, "step_index": step_index,
-                             "agent.step.number": step_index, "request_id": record.request_id}
-                    with span("agent.inference", model=MODEL_NAME, **attrs) as inference_span:
-                        inference_counter.add(1, {"model": MODEL_NAME})
-                        _emit("model.requested", attributes=attrs)
-                        started = time.perf_counter()
-                        try:
-                            response = client.chat.completions.create(
-                                model=MODEL_NAME, messages=messages, tools=tools or None,
-                                tool_choice="auto" if tools else None, max_tokens=4096, temperature=0.1,
-                                extra_headers={**inject_context(), "X-Request-Id": request_id})
-                        except APITimeoutError as exc:
-                            _emit("model.failed", attributes={**attrs, "error.type": type(exc).__name__}, severity="error")
-                            raise TaskTimeout("Inference request timed out") from exc
-                        except Exception as exc:
-                            _emit("model.failed", attributes={**attrs, "error.type": type(exc).__name__}, severity="error")
-                            raise
-                        finally:
-                            record.llm_inference_time_ms = (time.perf_counter() - started) * 1000
-                        usage = response.usage
-                        record.prompt_tokens = getattr(usage, "prompt_tokens", None)
-                        record.completion_tokens = getattr(usage, "completion_tokens", None)
-                        if record.prompt_tokens is not None and record.completion_tokens is not None:
-                            record.context_tokens = record.prompt_tokens + record.completion_tokens
-                        collect_engine_metrics(redis_client, record.request_id, record)
-                        message = response.choices[0].message
-                        calls = message.tool_calls or []
-                        decision = intent_decision([call.function.name for call in calls])
-                        for key, value in decision.items():
-                            value = json.dumps(value) if isinstance(value, list) else value
-                            inference_span.set_attribute("agent.intent." + key, value)
-                            turn_span.set_attribute("agent.intent." + key, value)
-                        _emit("model.completed", attributes={**attrs,
-                              "llm_inference_time_ms": record.llm_inference_time_ms,
-                              "context_tokens": record.context_tokens,
-                              "finish_reason": response.choices[0].finish_reason},
-                              payload={"response": safe_content(message.content or "")})
-                    messages.append(message.model_dump(exclude_none=True))
-                    if response.choices[0].finish_reason == "length":
-                        raise RuntimeError("Model response truncated by token limit")
-                    if not calls:
-                        if require_workspace_changes and not workspace_has_changes(workspace):
-                            rejected_completions += 1
-                            _emit("agent.completion.rejected", attributes={
-                                **attrs, "reason": "workspace_unchanged",
-                                "rejected_completions": rejected_completions,
-                            }, severity="error")
-                            if rejected_completions >= 2:
-                                raise RuntimeError("Coding task completed without making workspace changes")
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    "No workspace changes were detected, so the coding task is not complete. "
-                                    "Continue inspecting the repository and make the required changes. Do not "
-                                    "describe changes unless you actually apply them."
-                                ),
-                            })
-                            continue
-                        _emit("agent.completed", attributes=attrs)
-                        return message.content or "", messages
-                    acting_started = time.perf_counter()
-                    try:
-                        for call in calls:
-                            result = _execute_tool(call, workspace, record, tools)
-                            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-                    finally:
-                        record.step_t_acting_ms = (time.perf_counter() - acting_started) * 1000
-            raise StepLimitExceeded(f"Agent reached the limit of {max_steps} inference steps")
+            graph, close_step = _build_agent_graph(
+                client=client, workspace=workspace, tools=tools, measurements=measurements,
+                redis_client=redis_client, max_steps=max_steps,
+                require_workspace_changes=require_workspace_changes, turn_span=turn_span,
+            )
+            graph_attrs = {"graph.id": "agent.model-tools", "graph.type": "langgraph.state_graph",
+                           "graph.version": "1", "task.id": task_id, "run.id": run_id,
+                           "agent.id": agent_id, "agent.run.id": agent_run_id,
+                           "root.run.id": root_run_id or run_id,
+                           "parent.task.id": parent_task_id or "",
+                           "parent.run.id": parent_run_id or parent_agent_run_id or "",
+                           "agent.parent.run.id": parent_agent_run_id or "",
+                           "handoff.id": RUNTIME_CONTEXT.get().get("handoff_id", "")}
+            with span("langgraph.graph", **{"openinference.span.kind": "CHAIN", **graph_attrs}):
+                _emit("langgraph.graph.started", attributes=graph_attrs)
+                try:
+                  final_state = graph.invoke(
+                {"messages": messages, "step_index": 0, "tool_calls": [],
+                 "route": "model", "result": ""},
+                {"recursion_limit": max_steps * 2 + 2},
+                  )
+                except BaseException as exc:
+                  _emit("langgraph.graph.error", attributes={**graph_attrs, "error.type": type(exc).__name__}, severity="error")
+                  raise
+                finally:
+                  _emit("langgraph.graph.ended", attributes={**graph_attrs, "status": "terminal"})
+            return final_state["result"], final_state["messages"]
     finally:
+        if "close_step" in locals():
+            close_step()
         RUNTIME_CONTEXT.reset(context_token)
         client.close()
 
 
-def _execute_tool(call, workspace, record, tools):
+def _otel_content(value):
+    """Keep full-mode strings scalar; encode protected metadata for OTel."""
+    captured = safe_content(value)
+    return captured if isinstance(captured, str) else json.dumps(
+        captured, default=str, separators=(",", ":"))
+
+
+def _execute_tool(call, workspace, record, tools, *, tool_index=1, step_acting_started=None):
     attrs = {"program_id": record.program_id, "step_index": record.step_index,
-             "tool_name": call.function.name, "tool_call_id": call.id}
+             "tool_index": tool_index, "tool_name": call["name"], "tool_call_id": call["id"]}
     result, status = "", "Failed"
-    with span("agent.tool", **attrs) as current:
+    # OpenInference tool fields follow the configured content policy and are
+    # normalized to valid scalar OTel attributes. In full research mode these
+    # fields intentionally retain raw content; protected modes retain only
+    # redacted text or hash/length metadata.
+    safe_arguments = _otel_content(call["arguments"])
+    with span("agent.tool", **{"openinference.span.kind": "TOOL",
+                              "tool.name": call["name"],
+                              "tool.parameters": safe_arguments,
+                              "input.value": safe_arguments, **attrs}) as current:
         _emit("tool.started", attributes=attrs,
-              payload={"arguments": safe_content(call.function.arguments)})
+              payload={"arguments": safe_content(call["arguments"])})
+        if os.getenv("AGENT_TELEMETRY_CONTENT_CAPTURE", "redacted").lower() == "full":
+            current.add_event("agent.tool.arguments", {"arguments": call["arguments"]})
         started = time.perf_counter()
+        tool_ttf_ms = ((started - step_acting_started) * 1000
+                       if step_acting_started is not None else None)
         try:
-            args = json.loads(call.function.arguments or "{}")
+            args = json.loads(call["arguments"] or "{}")
             if not isinstance(args, dict):
                 raise ValueError("Tool arguments must be a JSON object")
-            if call.function.name not in {t["function"]["name"] for t in tools}:
-                raise ValueError(f"Tool is unavailable: {call.function.name}")
-            result = IMPLEMENTATIONS[call.function.name](args, workspace)
+            if call["name"] not in {t["function"]["name"] for t in tools}:
+                raise ValueError(f"Tool is unavailable: {call['name']}")
+            result = IMPLEMENTATIONS[call["name"]](args, workspace)
             # Legacy tools return readable errors; include all legacy prefixes.
             status = "Failed" if result.startswith("Error") else "Success"
         except TaskTimeout:
@@ -659,13 +912,25 @@ def _execute_tool(call, workspace, record, tools):
             current.record_exception(exc)
         finally:
             measured = {**attrs, "tool_status": status,
+                        "tool_ttf_ms": tool_ttf_ms,
                         "tool_latency_ms": (time.perf_counter() - started) * 1000}
+            latency = measured["tool_latency_ms"]
             record.tools.append(measured)
+            tool_call_metric.add(1, {"tool_name": call["name"], "tool_status": status})
+            tool_duration.record(measured["tool_latency_ms"], {"tool_name": call["name"], "tool_status": status})
+            if tool_ttf_ms is not None:
+                tool_wait.record(tool_ttf_ms, {"tool_name": call["name"]})
             for key, value in measured.items():
                 current.set_attribute(key, value)
+            current.set_attribute(
+                "output.value",
+                _otel_content(result),
+            )
             _emit("tool.completed", attributes=measured,
                   severity="info" if status == "Success" else "error",
                   payload={"result": safe_content(result)})
-            if status == "Success" and call.function.name in ("read_file", "write_file"):
-                _emit("artifact." + ("read" if call.function.name == "read_file" else "written"), attributes=attrs)
+            if os.getenv("AGENT_TELEMETRY_CONTENT_CAPTURE", "redacted").lower() == "full":
+                current.add_event("agent.tool.result", {"result": result, "tool_status": status})
+            if status == "Success" and call["name"] in ("read_file", "write_file"):
+                _emit("artifact." + ("read" if call["name"] == "read_file" else "written"), attributes=attrs)
     return result

@@ -60,7 +60,8 @@ differ; applying a manifest does not migrate existing ephemeral Redis data.
 ## Build and render for the existing two-node cluster
 
 Build both images from `/home/agentic/agentic`, then make the worker image available
-on the agent node and the vLLM image on the inference node. These are custom
+on the agent node and the vLLM image on the inference node. The worker image
+installs `requirements.txt`, including LangGraph. These are custom
 images: the stock vLLM image alone cannot provide the per-request adapter.
 
 ```sh
@@ -113,15 +114,21 @@ kubectl -n agentic-ai create secret generic hf-token \
 
 All application and host telemetry enters through the internal service `otel-collector:4318`, whose collector deployment is pinned to the node labelled `agentic.io/role=inference`:
 
-1. Agent gateway and worker emit agent intent, tool-call, task, inference, artifact, and handoff spans.
+1. The worker runs each task as a LangGraph `model -> tools -> model` state graph and emits agent intent, tool-call, task, inference, artifact, and handoff spans.
 2. `otel-node-collector` runs on every node and emits CPU, memory, disk, filesystem, network, process, and process-state metrics.
 3. vLLM emits inference traces and its Prometheus metrics are scraped by the Collector.
 
-The Collector sends traces to Phoenix and metrics to Prometheus remote write. In parallel, the gateway and workers maintain a Redis-backed execution ledger. This is the durable, framework-neutral record for dynamic multi-agent work; it is not a workflow graph. Every run is keyed by `run.id` and carries `user.id`, `session.id`, `task.id`, `agent.id`, `agent.run.id`, and optional `agent.parent.run.id`.
+The Collector sends traces to Phoenix, metrics to Prometheus remote write, and application logs to persistent Loki storage. In parallel, the gateway and workers maintain a Redis-backed execution ledger. The ledger is the durable record for dynamic multi-agent work; it does not orchestrate execution. The worker orchestrates each queued task with its LangGraph state graph. Every run is keyed by `run.id` and carries `user.id`, `session.id`, `task.id`, `agent.id`, `agent.run.id`, and optional `agent.parent.run.id`.
+
+Loki is internal to the cluster. To inspect logs locally, use `kubectl -n agentic-ai port-forward service/loki-svc 3100:3100`.
 
 The native agent exposes `delegate_to_agent` and `check_delegated_task` as dynamic tools. A delegated agent becomes a queued child task with its own agent/run identity and a shared root-run identity. Framework integrations can create or query runs through `POST /telemetry/events` without using these tools.
 
-The default ledger policy retains 30 days and keeps the most recent 10,000 events per run. It redacts likely credential values before persistence. Configure it on gateway and worker pods with:
+For a separate agents-only K3s deployment that calls an external vLLM endpoint,
+see [`agents-cluster/README.md`](agents-cluster/README.md). It retains worker,
+gateway, and Redis telemetry but does not collect local vLLM engine telemetry.
+
+The default ledger policy retains 30 days and keeps the most recent 10,000 events per run. Both supplied deployment modes use `full` capture for research: raw prompts, model responses, tool arguments/results, event payloads, and string attributes are persisted without redaction or truncation. Treat Redis, Loki, Phoenix, and Prometheus as sensitive research storage. `redacted` mode remains available if you modify the manifests.
 
 ```text
 AGENT_TELEMETRY_CONTENT_CAPTURE=off|redacted|full
@@ -129,7 +136,9 @@ AGENT_TELEMETRY_RETENTION_SECONDS=2592000
 AGENT_TELEMETRY_MAX_EVENTS_PER_RUN=10000
 ```
 
-Use `full` only for trusted, access-controlled evaluation environments.
+Use `full` only for trusted, access-controlled evaluation environments. Both
+deployments enable it explicitly for research, so their Redis, Loki, Phoenix,
+and Prometheus data can include credentials or private code.
 
 The default externally exposed services are:
 

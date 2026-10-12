@@ -44,7 +44,11 @@ def process_task(r, task_id):
     identity = {"program_id": task_id, "user.id": user, "session.id": session_id,
                 "task.id": task_id, "agent.id": task.get("agent_id", "legacy-agent"),
                 "agent.run.id": task.get("agent_run_id", task_id),
-                "agent.parent.run.id": task.get("parent_agent_run_id", "")}
+                "agent.parent.run.id": task.get("parent_agent_run_id", ""),
+                "root.run.id": task.get("root_run_id", run_id),
+                "parent.task.id": task.get("parent_task_id", ""),
+                "parent.run.id": task.get("parent_run_id", task.get("parent_agent_run_id", "")),
+                "handoff.id": task.get("handoff_id", "")}
     if not ledger.run(run_id):
         ledger.start_run(run_id, **identity)
 
@@ -80,6 +84,8 @@ def process_task(r, task_id):
                         benchmark=task.get("benchmark"), case_id=task.get("case_id"),
                         task_id=task_id, run_id=run_id, root_run_id=task.get("root_run_id", run_id),
                         agent_run_id=identity["agent.run.id"], parent_agent_run_id=identity["agent.parent.run.id"],
+                        parent_task_id=task.get("parent_task_id"), parent_run_id=task.get("parent_run_id"),
+                        handoff_id=task.get("handoff_id"),
                         agent_name=task.get("agent_name", "enterprise-agent"), event_sink=emit,
                         redis_client=r, measurements=measurements,
                         max_steps=int(task.get("max_steps", 100)), timeout_seconds=timeout_seconds,

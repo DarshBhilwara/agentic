@@ -8,7 +8,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 
-from telemetry import span
+from telemetry import span, inference_step_duration
 
 
 class TaskTimeout(TimeoutError):
@@ -21,7 +21,9 @@ class StepLimitExceeded(RuntimeError):
 
 ENGINE_FIELDS = (
     "step_t_reasoning_ms", "prefill_time_ms", "decode_time_ms",
-    "inference_queue_time_ms", "kv_recomputed_tokens",
+    "inference_queue_time_ms", "kv_recomputed_tokens", "kv_retained_tokens",
+    "kv_evicted_tokens", "kv_restored_tokens", "kv_memory_tier", "kv_eviction_cause",
+    "kv_residency", "cache_affinity_hit", "inference_replica_id",
 )
 
 
@@ -42,6 +44,20 @@ class StepRecord:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     kv_recomputed_tokens: int | None = None
+    kv_retained_tokens: int | None = None
+    kv_evicted_tokens: int | None = None
+    kv_restored_tokens: int | None = None
+    kv_memory_tier: str | None = None
+    kv_eviction_cause: str | None = None
+    kv_residency: str | None = None
+    cache_affinity_hit: bool | None = None
+    inference_replica_id: str | None = None
+    procedure_id: str | None = None
+    subgraph_id: str | None = None
+    expected_transition: str | None = None
+    actual_transition: str | None = None
+    constraint_violation: bool | None = None
+    guidance_tokens: int | None = None
     engine_metrics_status: str = "unavailable"
     tools: list = field(default_factory=list)
 
@@ -72,6 +88,7 @@ class ProgramTelemetry:
                 raise
             finally:
                 record.step_time_ms = (time.perf_counter() - started) * 1000
+                inference_step_duration.record(record.step_time_ms, {"step_status": record.step_status})
                 values = asdict(record)
                 for key, value in values.items():
                     if value is not None and key != "tools":
@@ -95,6 +112,7 @@ class ProgramTelemetry:
             "tool_failures": sum(t["tool_status"] != "Success" for s in self.steps for t in s.tools),
             "total_llm_inference_time_ms": total("llm_inference_time_ms"),
             "total_tool_time_ms": sum(t["tool_latency_ms"] for s in self.steps for t in s.tools),
+            "total_tool_ttf_ms": sum(t.get("tool_ttf_ms", 0) for s in self.steps for t in s.tools),
             "total_tool_wait_time_ms": total("step_t_acting_ms"),
             "total_reasoning_time_ms": total("step_t_reasoning_ms"),
             "total_prefill_time_ms": total("prefill_time_ms"),
@@ -105,6 +123,17 @@ class ProgramTelemetry:
             "context_tokens": self.steps[-1].context_tokens if self.steps else None,
             "peak_context_tokens": max((s.context_tokens for s in self.steps if s.context_tokens is not None), default=None),
             "kv_recomputed_tokens": total("kv_recomputed_tokens"),
+            "kv_retained_tokens": total("kv_retained_tokens"),
+            "kv_evicted_tokens": total("kv_evicted_tokens"),
+            "kv_restored_tokens": total("kv_restored_tokens"),
+            "cache_affinity_hits": sum(s.cache_affinity_hit is True for s in self.steps),
+            "cache_affinity_observations": sum(s.cache_affinity_hit is not None for s in self.steps),
+            "constraint_violations": sum(s.constraint_violation is True for s in self.steps),
+            "guidance_tokens": total("guidance_tokens"),
+            "reasoning_acting_ratio": (
+                total("step_t_reasoning_ms") / total("step_t_acting_ms")
+                if total("step_t_reasoning_ms") is not None and total("step_t_acting_ms") else None
+            ),
             "engine_measured_steps": sum(s.engine_metrics_status == "available" for s in self.steps),
         }
 

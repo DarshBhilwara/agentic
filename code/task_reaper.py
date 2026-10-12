@@ -7,6 +7,7 @@ import redis
 
 from program_telemetry import ProgramTelemetry, StepRecord
 from telemetry_ledger import TelemetryLedger, now
+from telemetry import span, event_counter
 
 
 def expire_tasks(r, *, grace_seconds=30):
@@ -15,6 +16,7 @@ def expire_tasks(r, *, grace_seconds=30):
         task_id = raw_id.decode()
         task = {k.decode(): v.decode() for k, v in r.hgetall(f"task:{task_id}").items()}
         if task and task.get("status") not in {"completed", "failed", "timeout"}:
+            event_counter.add(1, {"event.type": "task.timeout"})
             run_id = task.get("run_id", task_id)
             elapsed = max(0, (time.time() - float(task["submitted_at_unix"])) * 1000)
             previous = ledger.run(run_id)
@@ -41,7 +43,9 @@ def expire_tasks(r, *, grace_seconds=30):
             if not previous:
                 ledger.start_run(run_id, **{"program_id": task_id, "user.id": task["user"], "task.id": task_id})
             ledger.save_summary(run_id, summary)
-            ledger.emit("task.timeout", run_id=run_id, program_id=task_id, attributes=summary)
+            with span("agent.task.timeout", program_id=task_id, run_id=run_id,
+                      task_status="Timeout", termination_reason=summary["termination_reason"]):
+                ledger.emit("task.timeout", run_id=run_id, program_id=task_id, attributes=summary)
             ledger.finish_run(run_id, "timeout", task_status="Timeout")
             r.hset(f"task:{task_id}", mapping={"status": "timeout", "task_status": "Timeout",
                    "completed_at": now(), "error": "Deadline exceeded or worker lost", "task_completion_time_ms": elapsed})

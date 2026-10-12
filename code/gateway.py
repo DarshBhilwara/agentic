@@ -196,7 +196,8 @@ def get_telemetry_run(run_id: str, offset: int = 0, limit: int = 200, user: str 
     if not run or run.get("user.id") != user:
         raise HTTPException(404, detail="Telemetry run not found")
     return {"run": run, "summary": run.get("summary"), "steps": ledger.steps(run_id),
-            "events": ledger.events(run_id, offset=offset, limit=limit)}
+            "events": ledger.events(run_id, offset=offset, limit=limit),
+            "procedural_graph": ledger.graph(run_id)}
 
 
 @app.get("/telemetry/programs/{program_id}")
@@ -217,7 +218,10 @@ def ingest_telemetry_event(event: dict, user: str = Depends(verify_key)):
         raise HTTPException(404, detail="Telemetry run not found")
     identity = {key: event.get(key) for key in ("session.id", "task.id", "agent.id", "agent.run.id", "agent.parent.run.id", "handoff.id")}
     identity["user.id"] = user
-    attributes = {str(key): value if isinstance(value, (int, float, bool)) else redact_text(value, limit=1024)
-                  for key, value in (event.get("attributes") or {}).items()}
+    if os.getenv("AGENT_TELEMETRY_CONTENT_CAPTURE", "redacted").lower() == "full":
+        attributes = {str(key): value for key, value in (event.get("attributes") or {}).items()}
+    else:
+        attributes = {str(key): value if isinstance(value, (int, float, bool)) else redact_text(value, limit=1024)
+                      for key, value in (event.get("attributes") or {}).items()}
     return ledger.emit(event_type, run_id=run_id, attributes=attributes,
                        payload=safe_payload(event.get("payload")), severity=event.get("severity", "info"), **identity)

@@ -35,6 +35,16 @@ def fake_model(monkeypatch):
     return client.chat.completions.create
 
 
+def test_vllm_url_uses_mounted_configmap_and_falls_back_to_environment(tmp_path, monkeypatch):
+    endpoint = tmp_path / "url"
+    endpoint.write_text("http://inference.example:30800/v1\n")
+    monkeypatch.setenv("AGENT_VLLM_URL_FILE", str(endpoint))
+    monkeypatch.setenv("AGENT_VLLM_URL", "http://ignored:8000/v1")
+    assert agent.vllm_url() == "http://inference.example:30800/v1"
+    endpoint.unlink()
+    assert agent.vllm_url() == "http://ignored:8000/v1"
+
+
 def test_steps_include_all_tools_and_terminal_response(tmp_path, fake_model):
     fake_model.side_effect = [completion([tool(), tool(id="call-2")]), completion()]
     events = []

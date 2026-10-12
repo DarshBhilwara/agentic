@@ -33,9 +33,12 @@ def safe_content(value, *, limit=4096):
     digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
     if CONTENT_CAPTURE in ("off", "none", "metadata"):
         return {"sha256": digest, "length": len(text), "capture": "off"}
-    text = redact_text(text, limit=limit)
     if CONTENT_CAPTURE == "full":
-        return {"text": text, "sha256": digest, "length": len(str(value)), "capture": "full"}
+        # Research mode intentionally preserves the original value.  Do not
+        # redact or truncate: prompt, response, tool, and event payloads are
+        # the subject of the telemetry experiment.
+        return value
+    text = redact_text(text, limit=limit)
     return {"text": text, "sha256": digest, "length": len(str(value)), "capture": "redacted"}
 
 
@@ -46,7 +49,8 @@ def safe_payload(value):
     if isinstance(value, dict):
         return {str(key): safe_payload(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [safe_payload(item) for item in value[:100]]
+        items = value if CONTENT_CAPTURE == "full" else value[:100]
+        return [safe_payload(item) for item in items]
     return value
 
 
@@ -55,6 +59,9 @@ try:
     from opentelemetry import metrics, trace
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
@@ -76,6 +83,25 @@ try:
     trace.set_tracer_provider(tracer_provider)
     tracer = trace.get_tracer("agentic", "0.1")
 
+    logs_endpoint = os.getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+    if logs_endpoint:
+        logger_provider = LoggerProvider(resource=resource)
+        logger_provider.add_log_record_processor(
+            BatchLogRecordProcessor(OTLPLogExporter(endpoint=logs_endpoint))
+        )
+        # Install one handler on the root logger so worker, gateway, and reaper
+        # application logs become OTLP logs without changing existing loggers.
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        if not any(getattr(handler, "_agentic_otel", False) for handler in root_logger.handlers):
+            otel_handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
+            otel_handler._agentic_otel = True
+            root_logger.addHandler(otel_handler)
+        if not any(isinstance(handler, logging.StreamHandler) for handler in root_logger.handlers):
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+            root_logger.addHandler(console_handler)
+
     metrics_endpoint = os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
     if metrics_endpoint:
         reader = PeriodicExportingMetricReader(
@@ -92,6 +118,10 @@ try:
     program_duration = meter.create_histogram("agent.program.duration", unit="ms")
     program_queue = meter.create_histogram("agent.program.queue.duration", unit="ms")
     program_steps = meter.create_histogram("agent.program.inference.steps", unit="{step}")
+    inference_step_duration = meter.create_histogram("agent.inference.step.duration", unit="ms")
+    tool_duration = meter.create_histogram("agent.tool.duration", unit="ms")
+    tool_wait = meter.create_histogram("agent.tool.wait", unit="ms")
+    tool_calls = meter.create_counter("agent.tool.calls.total")
 
 except Exception:
     logging.exception("OpenTelemetry initialization failed; telemetry is disabled")
@@ -111,7 +141,7 @@ except Exception:
 
     tracer = _NoopTracer()
     task_counter = task_error_counter = inference_counter = event_counter = handoff_counter = _NoopMetric()
-    program_duration = program_queue = program_steps = _NoopMetric()
+    program_duration = program_queue = program_steps = inference_step_duration = tool_duration = tool_wait = tool_calls = _NoopMetric()
     otel_context = propagate = None
 
 
@@ -160,6 +190,8 @@ def intent_span(prompt, *, user, agent_id, session_id, turn_id, turn_number,
                 parent_agent_run_id=None):
     """Record agent intent with OpenTelemetry GenAI attributes/events."""
     attributes = {
+        "openinference.span.kind": "AGENT",
+        "agent.name": os.getenv("OTEL_AGENT_NAME", "enterprise-agent"),
         "gen_ai.operation.name": "invoke_agent",
         "gen_ai.agent.name": os.getenv("OTEL_AGENT_NAME", "enterprise-agent"),
         "agent.id": agent_id,

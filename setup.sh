@@ -9,8 +9,11 @@ case "$NODE_ROLE" in
   agent)
     BASE_DIR="/home/agentic/agentic"
     ;;
+  agents-server)
+    BASE_DIR="/home/agentic/agentic"
+    ;;
   *)
-    echo "Usage: $0 {inference|agent}" >&2
+    echo "Usage: $0 {inference|agent|agents-server}" >&2
     exit 2
     ;;
 esac
@@ -29,7 +32,7 @@ chmod -R 777 "$BASE_DIR/model-cache"
 
 # The inference host bootstraps the K3s server. The agent host joins that
 # server using credentials supplied in K3S_URL and K3S_TOKEN.
-if [[ "$NODE_ROLE" == "inference" ]]; then
+if [[ "$NODE_ROLE" == "inference" || "$NODE_ROLE" == "agents-server" ]]; then
   echo "=> Installing K3s server..."
   curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -
 else
@@ -63,6 +66,10 @@ EOF
   systemctl restart k3s
 
   echo "=> Setup complete. Kubeconfig is at /etc/rancher/k3s/k3s.yaml"
+elif [[ "$NODE_ROLE" == "agents-server" ]]; then
+  AGENT_NODE_NAME="$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"
+  kubectl label node "$AGENT_NODE_NAME" agentic.io/role=agent --overwrite
+  echo "=> Standalone agents-cluster ready. Kubeconfig is at /etc/rancher/k3s/k3s.yaml"
 else
   echo "=> Agent-node directory and K3s setup complete at $BASE_DIR"
 fi

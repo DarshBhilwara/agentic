@@ -9,11 +9,8 @@ import os
 import queue
 import threading
 import time
-from collections import OrderedDict
 
 LOG = logging.getLogger(__name__)
-HISTORY_LIMIT = 10000
-_history = OrderedDict()
 _outbox = queue.Queue(maxsize=10000)
 _registered = False
 
@@ -44,31 +41,19 @@ def request_metrics(group):
         "decode_time_ms": duration_ms(metrics.finished_time, metrics.first_token_time),
         "inference_queue_time_ms": None if metrics.time_in_queue is None else metrics.time_in_queue * 1000,
         "kv_recomputed_tokens": getattr(group, "_agentic_recomputed", None),
-        "kv_measurement": "previous_step_full_blocks_missing_from_prefix_cache",
+        # vLLM 0.8.5 does not expose per-request tier residency or eviction
+        # causes; retain explicit nulls until a supported engine hook exists.
+        "kv_retained_tokens": getattr(group, "_agentic_retained", None),
+        "kv_evicted_tokens": getattr(group, "_agentic_evicted", None),
+        "kv_restored_tokens": getattr(group, "_agentic_restored", None),
+        "kv_memory_tier": getattr(group, "_agentic_memory_tier", None),
+        "kv_residency": getattr(group, "_agentic_residency", None),
+        "kv_eviction_cause": getattr(group, "_agentic_eviction_cause", None),
+        "cache_affinity_hit": getattr(group, "_agentic_affinity_hit", None),
+        "inference_replica_id": os.getenv("INFERENCE_REPLICA_ID", os.getenv("HOSTNAME")),
+        "kv_measurement": getattr(group, "_agentic_kv_status", "unavailable"),
+        "kv_measurement_reason": getattr(group, "_agentic_kv_reason", "no per-request lifecycle attribution exposed"),
     }
-
-
-def matching_prefix_tokens(previous, current, block_size):
-    matched = 0
-    for left, right in zip(previous, current):
-        if left != right:
-            break
-        matched += block_size
-    return matched
-
-
-def _block_hashes(seq, computed_only=False):
-    from vllm.core.block.prefix_caching_block import PrefixCachingBlock
-    tokens = seq.get_token_ids()
-    length = seq.data.get_num_computed_tokens() if computed_only else len(tokens)
-    previous = None
-    hashes = []
-    for offset in range(0, length - seq.block_size + 1, seq.block_size):
-        previous = PrefixCachingBlock.hash_block_tokens(
-            is_first_block=offset == 0, prev_block_hash=previous,
-            cur_block_token_ids=list(tokens[offset:offset + seq.block_size]), extra_hash=seq.extra_hash())
-        hashes.append(previous)
-    return hashes
 
 
 def _publish_loop():
@@ -99,23 +84,11 @@ def register():
     create_trace = LLMEngine.create_trace_span
 
     def measured_allocate(manager, group):
-        program_id, step = request_identity(group.request_id)
-        # Only first admission: preemption must not overwrite inter-step loss.
-        if program_id and not hasattr(group, "_agentic_recomputed"):
-            group._agentic_recomputed = None
-            try:
-                seqs = group.get_seqs()
-                if manager.enable_caching and len(seqs) == 1:
-                    seq = seqs[0]
-                    previous = _history.get(program_id)
-                    if step == 1:
-                        group._agentic_recomputed = 0
-                    elif previous and previous[0] == step - 1:
-                        reusable = matching_prefix_tokens(previous[1], _block_hashes(seq), seq.block_size)
-                        cached = manager.get_num_cached_tokens(seq)
-                        group._agentic_recomputed = max(0, reusable - cached)
-            except Exception:
-                LOG.exception("KV measurement unavailable for %s", group.request_id)
+        # v0.8.5 V0 exposes allocation at block-manager scope, but does not
+        # attach free/swap ownership to a request. Never infer per-request KV
+        # values from prefix hashes; preserve nulls and state the limitation.
+        group._agentic_kv_status = "unavailable"
+        group._agentic_kv_reason = "vLLM 0.8.5 V0 allocation hook has no request-scoped free/swap attribution"
         return allocate(manager, group)
 
     def measured_trace(engine, group):
@@ -124,12 +97,6 @@ def register():
             program_id, step = request_identity(group.request_id)
             if program_id:
                 data = request_metrics(group)
-                seqs = group.get_finished_seqs()
-                if len(seqs) == 1:
-                    _history[program_id] = (step, _block_hashes(seqs[0], computed_only=True))
-                    _history.move_to_end(program_id)
-                    while len(_history) > HISTORY_LIMIT:
-                        _history.popitem(last=False)
                 try:
                     _outbox.put_nowait((group.request_id, data))
                 except queue.Full:
