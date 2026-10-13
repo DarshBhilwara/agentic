@@ -2,6 +2,7 @@ import os
 import logging
 import re
 import hashlib
+import json
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
@@ -52,6 +53,114 @@ def safe_payload(value):
         items = value if CONTENT_CAPTURE == "full" else value[:100]
         return [safe_payload(item) for item in items]
     return value
+
+
+def export_ledger_event(event, *, procedural_graph=None, summary=None):
+    """Export one durable ledger envelope as a child span, best effort.
+
+    A standalone span per event avoids OpenTelemetry span-event count limits.
+    Content values pass through the same capture policy used by other traces.
+    """
+    try:
+        timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
+        start_time = int(timestamp.timestamp() * 1_000_000_000)
+        attrs = {
+            "openinference.span.kind": "CHAIN",
+            "telemetry.event.schema_version": event["schema_version"],
+            "telemetry.event.id": event["id"],
+            "telemetry.event.type": event["type"],
+            "telemetry.event.severity": event["severity"],
+            "telemetry.event.timestamp": event["timestamp"],
+        }
+        reserved = {"id", "schema_version", "timestamp", "type", "severity", "attributes", "payload"}
+        attrs.update({key: _attribute_value(value) for key, value in event.items()
+                      if key not in reserved and value is not None})
+        if event.get("attributes"):
+            attrs["telemetry.event.attributes"] = json.dumps(
+                _safe_export_payload(event["attributes"]), default=str, separators=(",", ":"))
+        if event.get("payload"):
+            attrs["telemetry.event.payload"] = json.dumps(
+                _safe_export_payload(event["payload"]), default=str, separators=(",", ":"))
+        if procedural_graph is not None:
+            attrs["procedural_graph"] = graph_snapshot_json(procedural_graph)
+        if summary is not None:
+            attrs["agent.program.summary"] = json.dumps(
+                summary, default=str, separators=(",", ":"))
+        with tracer.start_as_current_span(event["type"], start_time=start_time) as current:
+            for key, value in attrs.items():
+                current.set_attribute(key, value)
+            if (event["severity"].lower() in ("error", "fatal", "critical") or
+                    event["type"].endswith((".failed", ".error", ".timeout"))):
+                try:
+                    from opentelemetry.trace import Status, StatusCode
+                    current.set_status(Status(StatusCode.ERROR, event["type"]))
+                except Exception:
+                    pass
+    except Exception:
+        logging.exception("Unable to export telemetry ledger event %s", event.get("id"))
+
+
+def json_attribute(value):
+    """Serialize structured span data after applying the configured capture policy."""
+    return json.dumps(_safe_export_payload(value), default=str, separators=(",", ":"))
+
+
+def set_error_status(current, description):
+    try:
+        from opentelemetry.trace import Status, StatusCode
+        current.set_status(Status(StatusCode.ERROR, str(description)))
+    except Exception:
+        pass
+
+
+def _safe_export_payload(value):
+    """Apply capture policy while preserving already-captured content wrappers."""
+    if isinstance(value, dict):
+        if _valid_capture_wrapper(value, "redacted"):
+            if CONTENT_CAPTURE in ("off", "none", "metadata"):
+                return {"sha256": value["sha256"], "length": value["length"], "capture": "off"}
+            return {"text": redact_text(value["text"]), "sha256": value["sha256"],
+                    "length": value["length"], "capture": "redacted"}
+        if _valid_capture_wrapper(value, "off"):
+            return value
+        return {str(key): _safe_export_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        items = value if CONTENT_CAPTURE == "full" else value[:100]
+        return [_safe_export_payload(item) for item in items]
+    return safe_content(value) if isinstance(value, str) else value
+
+
+def _valid_capture_wrapper(value, mode):
+    expected = {"text", "sha256", "length", "capture"} if mode == "redacted" else {"sha256", "length", "capture"}
+    digest = value.get("sha256")
+    length = value.get("length")
+    return (
+        set(value) == expected and value.get("capture") == mode and
+        isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None and
+        isinstance(length, int) and not isinstance(length, bool) and length >= 0 and
+        (mode != "redacted" or isinstance(value.get("text"), str))
+    )
+
+
+def graph_snapshot_json(graph):
+    """Encode topology without hiding structure; protect string values by policy."""
+    mode = CONTENT_CAPTURE
+
+    def protect(value):
+        if isinstance(value, dict):
+            return {str(key): protect(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [protect(item) for item in value]
+        if isinstance(value, str):
+            if mode in ("off", "none", "metadata"):
+                return {"sha256": hashlib.sha256(value.encode("utf-8", "replace")).hexdigest(),
+                        "length": len(value), "capture": "off"}
+            if mode == "full":
+                return value
+            return redact_text(value)
+        return value
+
+    return json.dumps(protect(graph), default=str, separators=(",", ":"))
 
 
 try:
@@ -129,6 +238,7 @@ except Exception:
         def __enter__(self): return self
         def __exit__(self, *_args): return False
         def set_attribute(self, *_args): return None
+        def set_status(self, *_args): return None
         def record_exception(self, *_args): return None
         def add_event(self, *_args, **_kwargs): return None
 

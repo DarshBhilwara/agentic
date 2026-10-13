@@ -14,7 +14,7 @@ import requests
 from langgraph.graph import END, START, StateGraph
 from openai import OpenAI, APITimeoutError
 from telemetry import (event_counter, handoff_counter, inference_counter, inject_context,
-                       intent_span, safe_content, safe_payload, span, trace_identity,
+                       graph_snapshot_json, intent_span, safe_content, safe_payload, span, trace_identity,
                        tool_calls as tool_call_metric, tool_duration, tool_wait)
 from program_telemetry import ProgramTelemetry, TaskTimeout, StepLimitExceeded, collect_engine_metrics
 from telemetry_ledger import TelemetryLedger
@@ -570,6 +570,7 @@ class AgentGraphState(TypedDict):
     step_index: int
     tool_calls: List[Dict[str, str]]
     route: Literal["model", "tools", "end"]
+    previous_node: str
     result: str
 
 
@@ -604,7 +605,7 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
         # action windows by the ledger; do not stamp a constant topology ID.
         record.procedure_id = None
         record.subgraph_id = None
-        previous_node = "tools" if state.get("step_index") else "START"
+        previous_node = state.get("previous_node", "START")
         _emit("procedural_graph.observed", attributes={
             "node": f"model:{step_index}", "previous_node": previous_node,
             "action": "model.request", "validation": {"allowed": ["model->tools", "model->model", "model->END"]}})
@@ -715,7 +716,8 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
                     ),
                 })
                 return {"messages": messages, "step_index": step_index,
-                        "tool_calls": [], "route": "model"}
+                        "tool_calls": [], "route": "model",
+                        "previous_node": f"model:{step_index}"}
             result = message.content or ""
             _emit("procedural_graph.observed", attributes={"node": "END",
                   "previous_node": f"model:{step_index}", "action": "terminal.success"})
@@ -778,7 +780,8 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
               "acting_time_ms": record.step_t_acting_ms,
               "idleness_ratio": record.step_t_acting_ms / max(record.step_t_acting_ms + record.llm_inference_time_ms, 1)})
         close_step()
-        return {"messages": messages, "tool_calls": [], "route": "model"}
+        return {"messages": messages, "tool_calls": [], "route": "model",
+                "previous_node": f"tools:{state['step_index']}"}
 
     def route_after_model(state: AgentGraphState):
         return state["route"]
@@ -843,8 +846,9 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
                            "parent.run.id": parent_run_id or parent_agent_run_id or "",
                            "agent.parent.run.id": parent_agent_run_id or "",
                            "handoff.id": RUNTIME_CONTEXT.get().get("handoff_id", "")}
-            with span("langgraph.graph", **{"openinference.span.kind": "CHAIN", **graph_attrs}):
+            with span("langgraph.graph", **{"openinference.span.kind": "CHAIN", **graph_attrs}) as graph_span:
                 _emit("langgraph.graph.started", attributes=graph_attrs)
+                graph_status = "success"
                 try:
                   final_state = graph.invoke(
                 {"messages": messages, "step_index": 0, "tool_calls": [],
@@ -852,10 +856,19 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
                 {"recursion_limit": max_steps * 2 + 2},
                   )
                 except BaseException as exc:
+                  graph_status = "error"
                   _emit("langgraph.graph.error", attributes={**graph_attrs, "error.type": type(exc).__name__}, severity="error")
                   raise
                 finally:
                   _emit("langgraph.graph.ended", attributes={**graph_attrs, "status": "terminal"})
+                  if redis_client is not None:
+                    try:
+                      snapshot = TelemetryLedger(redis_client).graph(run_id)
+                      if snapshot is not None:
+                        graph_span.set_attribute("procedural_graph", graph_snapshot_json(snapshot))
+                    except Exception:
+                      pass
+                  graph_span.set_attribute("procedural_graph.status", graph_status)
             return final_state["result"], final_state["messages"]
     finally:
         if "close_step" in locals():

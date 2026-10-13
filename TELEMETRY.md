@@ -258,9 +258,10 @@ Both supplied research deployments set `full`. In that mode the
 Redis ledger retains raw prompt, model response, tool argument/result, event
 payload, and string attribute values, including full lists (no content
 redaction or truncation). OTLP span events additionally retain the exact model
-request/response and tool arguments/results. Generic gateway event payloads are
-ledger-only. This is intentionally unsuitable for production or untrusted
-users and may contain secrets.
+request/response and tool arguments/results. Every event accepted by the
+central execution ledger is also exported as an individual OTLP span with
+JSON-encoded structured attributes and payload. This is intentionally
+unsuitable for production or untrusted users and may contain secrets.
 
 Full mode also adds the exact per-step model `messages` request and response,
 plus tool arguments and results, as correlated OpenTelemetry span events in
@@ -341,9 +342,32 @@ and the deadline reaper marks those fields unknown and writes
 `timing_complete=false`. In agents-only mode, remote vLLM engine telemetry
 (`inference_queue_time_ms`, prefill/decode timing, and KV recomputation) is out
 of scope unless the external inference service exports an equivalent adapter.
-Finally, Redis `_emit`/ledger events are not automatically Phoenix spans;
-only explicitly created graph, node, agent, inference, and tool spans appear
-as spans.
+Every event persisted by `TelemetryLedger.emit` is exported as a standalone
+child span named for its event type. This includes model/tool steps, phase
+transitions, handoffs, graph observations, queued tasks, externally ingested
+events, and reaper timeouts. Each span carries the event ID, timestamp,
+severity, schema version, all supplied identity fields, and JSON-encoded
+structured attributes and payload. Error and fatal events carry OpenTelemetry
+error status. Export failures are logged and do not interrupt execution.
+
+Terminal task events also carry the final procedural graph and saved program
+summary, covering successful, failed, and reaped runs. The `langgraph.graph`
+span carries the final `procedural_graph` JSON snapshot and
+`procedural_graph.status`; `agent.program` carries its final summary JSON and
+`agent.program.status`. Graph node IDs, action labels, signatures, procedure
+run matches, subgraphs, and delegation edges remain readable in the snapshot.
+Phoenix shows these values in span details; it does not render the JSON as a
+separate native node-and-edge canvas. The trace tree shows event spans beneath
+the active execution span while the snapshot preserves procedural topology.
+In `redacted` mode, topology string values pass through secret masking. In
+`off` mode, string values such as node names, action labels, and signatures are
+replaced with hash/length metadata; JSON keys and numeric structure remain
+available, while identifier values are intentionally obscured.
+
+The existing manifests route OTLP traces, metrics, and logs through the
+collector, whose trace pipeline forwards to Phoenix. This documents the
+application export path; it does not verify a running collector or Phoenix
+deployment.
 
 
 # Durable procedural graphs and KV limits

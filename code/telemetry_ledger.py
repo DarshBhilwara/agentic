@@ -85,6 +85,17 @@ class TelemetryLedger:
         pipe.expire(event_key, EVENT_TTL_SECONDS)
         pipe.execute()
         self._materialize_graph(run_id, event_type, attributes or {}, payload or {}, identity.get("user.id"))
+        try:
+            from telemetry import export_ledger_event
+            terminal = event_type in {"task.completed", "task.failed", "task.timeout"}
+            export_ledger_event(
+                event,
+                procedural_graph=self.graph(run_id) if terminal else None,
+                summary=(self.run(run_id) or {}).get("summary") if terminal else None,
+            )
+        except Exception:
+            # Export outages must not interrupt task execution or durable writes.
+            pass
         return event
 
     def _materialize_graph(self, run_id, event_type, attributes, payload, owner=None):

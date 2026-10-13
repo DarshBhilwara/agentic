@@ -12,7 +12,9 @@ from openai import APITimeoutError
 
 from agent import run
 from program_telemetry import ProgramTelemetry, TaskTimeout
-from telemetry import parent_context, safe_content, span, task_counter, task_error_counter, program_duration, program_queue, program_steps
+from telemetry import (parent_context, safe_content, span, task_counter,
+                       set_error_status, task_error_counter, program_duration,
+                       program_queue, program_steps)
 from telemetry_ledger import TelemetryLedger, now
 
 
@@ -114,6 +116,10 @@ def process_task(r, task_id):
                 summary = measurements.summary(status, elapsed_ms)
                 summary.update({"benchmark": task.get("benchmark", ""), "instance_id": task.get("case_id", "")})
                 ledger.save_summary(run_id, summary)
+                current.set_attribute("agent.program.summary", json.dumps(summary, separators=(",", ":")))
+                current.set_attribute("agent.program.status", status)
+                if status != "Success":
+                    set_error_status(current, status)
                 labels = {"task_status": status, "benchmark": task.get("benchmark", "")}
                 program_duration.record(elapsed_ms, labels)
                 program_queue.record(wait_ms, labels)

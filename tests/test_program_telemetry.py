@@ -69,6 +69,28 @@ def test_steps_include_all_tools_and_terminal_response(tmp_path, fake_model):
     assert ".2." in requests[1].kwargs["extra_headers"]["X-Request-Id"]
 
 
+@pytest.mark.parametrize("with_tools", [True, False])
+def test_procedural_graph_connects_consecutive_steps(tmp_path, fake_model, monkeypatch, with_tools):
+    fake_model.side_effect = [completion([tool()] if with_tools else None), completion()]
+    if not with_tools:
+        monkeypatch.setattr(agent, "workspace_has_changes", Mock(side_effect=[False, True]))
+    ledger = TelemetryLedger(fakeredis.FakeRedis())
+    ledger.start_run("run", **{"user.id": "alice"})
+
+    def emit(event_type, *, attributes=None, payload=None, severity="info", **extra):
+        ledger.emit(event_type, run_id="run", attributes=attributes, payload=payload,
+                    severity=severity, **extra)
+
+    monkeypatch.setattr(agent, "_emit", emit)
+    agent.run("fix", "alice", workspace=str(tmp_path), require_workspace_changes=not with_tools)
+    graph = ledger.graph("run")
+    predecessor = "tools:1" if with_tools else "model:1"
+    assert ["START", "model:1"] in graph["edges"]
+    assert [predecessor, "model:2"] in graph["edges"]
+    assert ["model:2", "END"] in graph["edges"]
+    assert "tools" not in graph["nodes"]
+
+
 @pytest.mark.parametrize("call", [tool(arguments="bad json"), tool(name="missing"),
     tool(name="read_file", arguments='{"path":"missing.txt"}'),
     tool(name="execute_command", arguments='{"command":"exit 3"}')])

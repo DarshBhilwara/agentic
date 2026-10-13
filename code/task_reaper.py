@@ -1,5 +1,6 @@
 """Finalize expired queued/abandoned tasks without replaying tool side effects."""
 import logging
+import json
 import os
 import time
 
@@ -7,7 +8,7 @@ import redis
 
 from program_telemetry import ProgramTelemetry, StepRecord
 from telemetry_ledger import TelemetryLedger, now
-from telemetry import span, event_counter
+from telemetry import parent_context, span, event_counter
 
 
 def expire_tasks(r, *, grace_seconds=30):
@@ -43,9 +44,20 @@ def expire_tasks(r, *, grace_seconds=30):
             if not previous:
                 ledger.start_run(run_id, **{"program_id": task_id, "user.id": task["user"], "task.id": task_id})
             ledger.save_summary(run_id, summary)
-            with span("agent.task.timeout", program_id=task_id, run_id=run_id,
-                      task_status="Timeout", termination_reason=summary["termination_reason"]):
-                ledger.emit("task.timeout", run_id=run_id, program_id=task_id, attributes=summary)
+            identity = {
+                "program_id": task_id, "user.id": task.get("user", ""),
+                "session.id": task.get("session_id", ""), "task.id": task_id,
+                "agent.id": task.get("agent_id", ""), "agent.run.id": task.get("agent_run_id", ""),
+                "agent.parent.run.id": task.get("parent_agent_run_id", ""),
+                "root.run.id": task.get("root_run_id", run_id),
+                "parent.task.id": task.get("parent_task_id", ""),
+                "parent.run.id": task.get("parent_run_id", task.get("parent_agent_run_id", "")),
+                "handoff.id": task.get("handoff_id", ""),
+            }
+            with parent_context(json.loads(task.get("trace_context", "{}"))):
+                with span("agent.task.timeout", **{"run.id": run_id, **identity,
+                          "task_status": "Timeout", "termination_reason": summary["termination_reason"]}):
+                    ledger.emit("task.timeout", run_id=run_id, attributes=summary, **identity)
             ledger.finish_run(run_id, "timeout", task_status="Timeout")
             r.hset(f"task:{task_id}", mapping={"status": "timeout", "task_status": "Timeout",
                    "completed_at": now(), "error": "Deadline exceeded or worker lost", "task_completion_time_ms": elapsed})
