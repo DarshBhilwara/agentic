@@ -50,12 +50,19 @@ def test_dataset_local_revision_and_selection(tmp_path):
 
 def test_benchmark_exports_all_event_pages(tmp_path):
     def request(method, path, params):
+        if path.endswith("/kernel"):
+            records = [{"syscall_id": i} for i in range(
+                params["offset"], min(params["offset"] + params["limit"], 503))]
+            return {"records": records, "total": 503, "retained": 503, "truncated": False,
+                    "status": {"perf_lost": 0}}
         events = [{"id": str(i)} for i in range(params["offset"], min(params["offset"] + 1000, 1002))]
         return {"events": events, "steps": [{"step_index": 1}], "run": {"status": "completed"},
                 "summary": {"program_id": "p", "inference_steps": 1}}
     result = benchmark.export_trace(request, "run", tmp_path)
     assert result["program_id"] == "p"
     assert len((tmp_path / "events.jsonl").read_text().splitlines()) == 1002
+    assert len((tmp_path / "kernel.jsonl").read_text().splitlines()) == 503
+    assert json.loads((tmp_path / "kernel-status.json").read_text())["truncated"] is False
 
 
 def test_two_node_manifests_and_persistence():

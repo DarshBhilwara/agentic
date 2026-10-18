@@ -58,7 +58,7 @@ unknown measurements are JSON `null`, never fabricated zeroes.
 | `prefill_time_ms` | Inference-node first scheduling to first generated token. A phase wall time, not isolated CUDA prefill kernel time. |
 | `decode_time_ms` | First generated token to request finish on the inference node. Zero is valid for a one-token completion. Includes interleaved scheduling/preemption. |
 | `inference_queue_time_ms` | Initial vLLM scheduling wait, distinct from the task queue on the agent node. |
-| `kv_recomputed_tokens` | Previously computed **full prefix-cache blocks** shared with the immediately previous step but unavailable for reuse at this step's admission, in tokens. See limits below. |
+| `kv_recomputed_tokens` | Per-request recomputation tokens when supported by engine lifecycle attribution. Null in the shipped vLLM 0.8.5 V0 adapter. See limits below. |
 
 Program summaries contain `total_llm_inference_time_ms`, `total_tool_time_ms`
 (sum of tool invocation durations), `total_tool_wait_time_ms`,
@@ -99,29 +99,6 @@ and results subject to the content-capture policy. Successful `read_file` and
 `write_file` calls emit `artifact.read` and `artifact.written`; the worker also
 emits `artifact.written` for the final task-result file.
 
-### Separate agents-only cluster
-
-The standalone `agents-cluster/` deployment keeps the agent gateway, workers,
-Redis ledger, and workspace storage in a separate Kubernetes cluster. It calls
-an externally reachable OpenAI-compatible vLLM endpoint, configured once in
-the `agent-inference` ConfigMap as `AGENT_VLLM_URL`. Workers read the projected
-ConfigMap file at the start of every agent run, so a ConfigMap update routes
-future runs to the new endpoint after Kubernetes propagates the projection
-(typically up to about two minutes). A run already in progress continues using
-the endpoint selected when it started.
-
-This deployment deliberately does not install vLLM or the NVIDIA device plugin.
-It includes an OpenTelemetry Collector; configure remote Phoenix OTLP and
-Prometheus remote-write URLs in `agent-inference`. Its Redis instance is
-separate from the inference cluster's Redis. Consequently, it retains durable
-agent tasks, steps, tool calls, client-side `llm_inference_time_ms`, and the
-normal run/event API, but it cannot join remote vLLM adapter measurements.
-`step_t_reasoning_ms`, `prefill_time_ms`, `decode_time_ms`,
-`inference_queue_time_ms`, and `kv_recomputed_tokens` remain `null`, and
-`engine_measured_steps` is zero unless equivalent measurements are explicitly
-made available to that cluster. Use the original single-cluster deployment for
-the full inference-engine telemetry described below.
-
 ### Inference-node adapter
 
 Build `inference/Dockerfile` and use the supplied inference manifest. It requires
@@ -133,14 +110,11 @@ durable step. A bounded background queue keeps Redis I/O off the scheduler.
 Absent/late/dropped measurements stay null. Collection adds up to 0.5 seconds
 of join wait per missing record, included in task time but not model time.
 
-KV accounting compares actual chained token-block hashes, not prompt lengths.
-It excludes newly added context and incomplete blocks. It measures lost prefix
-reuse between requests; it does not distinguish capacity eviction from an
-explicit cache reset, and does not count within-request preemption recompute.
-An inference restart, missing prior step, disabled prefix cache, or expiration
-from the 10,000-program in-process history makes this field null. The first
-step is zero when the adapter and prefix cache are active. These limits are
-intentional: missing history is not evidence of zero eviction.
+The shipped adapter does not expose request-scoped allocation/free/swap
+ownership. KV recomputation, retention, eviction, restoration, tier, residency,
+and affinity fields therefore remain null, including the first step. The
+adapter supplies an unavailable status/reason; prefix-hash overlap is not used
+as evidence of recomputation or eviction.
 
 The implementation follows the pinned upstream
 [request timing fields](https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/sequence.py),
@@ -244,7 +218,7 @@ POST /telemetry/events
 The gateway authenticates every request, verifies run ownership, and replaces
 the supplied user identity with the authenticated user. In `redacted` mode,
 payload strings and external attributes are masked before storage; in the
-agents-only `full` research mode they are retained verbatim.
+`full` research mode they are retained verbatim.
 
 ## Retention and capture
 
@@ -254,7 +228,7 @@ Defaults are 30 days and 10,000 events. Set
 `redacted` for masked bounded content, or `full` only in a trusted evaluation
 environment.
 
-Both supplied research deployments set `full`. In that mode the
+The supplied research deployment sets `full`. In that mode the
 Redis ledger retains raw prompt, model response, tool argument/result, event
 payload, and string attribute values, including full lists (no content
 redaction or truncation). OTLP span events additionally retain the exact model
@@ -292,7 +266,7 @@ The runtime exports these custom metrics to Prometheus through the collector:
 
 The collector also scrapes vLLM's native Prometheus endpoint every 15 seconds.
 
-Both deployment collectors use bounded file-backed sending queues on a
+The collectors use bounded file-backed sending queues on a
 two-gigabyte persistent volume and exporter retry (up to five minutes) for
 Phoenix and Prometheus remote write. This
 protects against short observability outages; the Redis execution ledger
@@ -339,10 +313,7 @@ Telemetry completeness limits are explicit: missing engine fields mean the
 measurement was unavailable, late, failed before collection, or outside the
 join window; they never mean zero. A worker crash can lose partial timings,
 and the deadline reaper marks those fields unknown and writes
-`timing_complete=false`. In agents-only mode, remote vLLM engine telemetry
-(`inference_queue_time_ms`, prefill/decode timing, and KV recomputation) is out
-of scope unless the external inference service exports an equivalent adapter.
-Every event persisted by `TelemetryLedger.emit` is exported as a standalone
+`timing_complete=false`. Every event persisted by `TelemetryLedger.emit` is exported as a standalone
 child span named for its event type. This includes model/tool steps, phase
 transitions, handoffs, graph observations, queued tasks, externally ingested
 events, and reaper timeouts. Each span carries the event ID, timestamp,
@@ -387,3 +358,21 @@ allocation/free/swap ownership is exposed by the engine. Otherwise fields remain
 null and `kv_measurement_reason` explains the unavailable attribution. Prefix
 hash comparisons are not used as eviction or recomputation claims. Tool latency
 is retained only as observed timing; it does not predict or control KV retention.
+
+## Kernel syscall layer
+
+The dedicated eBPF collector records syscall entry and exit separately from the
+semantic execution ledger. See [kernel collection](kernel/README.md) for event
+fields, cgroup scope, configuration, retention/loss behavior, and cluster smoke
+checks. [The overall plan](TELEMETRY_PLAN.md) records the three-layer design and
+the deferred GUI. Kernel observations require privileged node deployment;
+ordinary host/process metrics do not substitute for syscall tracing.
+
+## Console and report snapshots
+
+The gateway's `/dashboard/` console provides configuration previews, device and
+collector observations, run inspection, and bounded report exports. Its
+authenticated `/console` API retains the existing run ownership boundary.
+See [GUI.md](GUI.md) for startup, capture controls, offline/demo behavior,
+report limits, and read-only Kubernetes discovery. Configuration drafts and
+observed deployment state are distinct; previewing settings does not apply them.

@@ -12,6 +12,13 @@ def _attribute_value(value):
 
 
 CONTENT_CAPTURE = os.getenv("AGENT_TELEMETRY_CONTENT_CAPTURE", "redacted").lower()
+
+
+class _SuppressedSpan:
+    def set_attribute(self, *_args): return None
+    def set_status(self, *_args): return None
+    def record_exception(self, *_args): return None
+    def add_event(self, *_args, **_kwargs): return None
 _SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|authorization|bearer|password|secret|token)\s*([:=]|\s)\s*(?:bearer\s+)?[^\s,;]+"
 )
@@ -62,6 +69,11 @@ def export_ledger_event(event, *, procedural_graph=None, summary=None):
     Content values pass through the same capture policy used by other traces.
     """
     try:
+        from collection_policy import is_semantic_event, semantic_capture_enabled
+        if not semantic_capture_enabled() and is_semantic_event(event.get("type", "")):
+            return
+        if not semantic_capture_enabled():
+            procedural_graph = None
         timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
         start_time = int(timestamp.timestamp() * 1_000_000_000)
         attrs = {
@@ -257,6 +269,15 @@ except Exception:
 
 @contextmanager
 def span(name, *, context=None, **attributes):
+    from collection_policy import detailed_capture_enabled, program_capture_enabled, semantic_capture_enabled
+    if not detailed_capture_enabled() and name not in {"agent.task.submit", "agent.task.get"}:
+        yield _SuppressedSpan()
+        return
+    if ((name.startswith(("agent.program", "agent.step", "agent.inference", "agent.tool"))) and not program_capture_enabled()) or (
+        name.startswith("langgraph.") and not semantic_capture_enabled()
+    ):
+        yield _SuppressedSpan()
+        return
     kwargs = {"context": context} if context is not None else {}
     with tracer.start_as_current_span(name, **kwargs) as current:
         for key, value in attributes.items():
@@ -299,6 +320,10 @@ def intent_span(prompt, *, user, agent_id, session_id, turn_id, turn_number,
                 benchmark=None, case_id=None, model=None, run_id=None, agent_run_id=None,
                 parent_agent_run_id=None):
     """Record agent intent with OpenTelemetry GenAI attributes/events."""
+    from collection_policy import semantic_capture_enabled
+    if not semantic_capture_enabled():
+        yield _SuppressedSpan()
+        return
     attributes = {
         "openinference.span.kind": "AGENT",
         "agent.name": os.getenv("OTEL_AGENT_NAME", "enterprise-agent"),

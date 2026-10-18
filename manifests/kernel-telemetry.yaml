@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: kernel-telemetry, namespace: agentic-ai}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: kernel-telemetry, namespace: agentic-ai}
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: kernel-telemetry, namespace: agentic-ai}
+subjects:
+- kind: ServiceAccount
+  name: kernel-telemetry
+  namespace: agentic-ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kernel-telemetry
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kernel-telemetry
+  namespace: agentic-ai
+spec:
+  selector:
+    matchLabels: {app: kernel-telemetry}
+  template:
+    metadata:
+      labels: {app: kernel-telemetry}
+    spec:
+      hostPID: true
+      serviceAccountName: kernel-telemetry
+      nodeSelector: {}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: agentic.io/role, operator: In, values: [agent, inference]}
+      tolerations: [{operator: Exists}]
+      containers:
+      - name: collector
+        image: agentic-kernel:0.1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        env:
+        - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+        - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+        - {name: REDIS_URL, value: "redis://redis-service:6379/0"}
+        - {name: KERNEL_SOCKET, value: /run/agentic-kernel/collector.sock}
+        - {name: KERNEL_ARCHIVE, value: /var/log/agentic-kernel}
+        - {name: KERNEL_CAPTURE_ENABLED, value: "true"}
+        - {name: KERNEL_INFERENCE_SYSCALLS_ENABLED, value: "true"}
+        - {name: KERNEL_REDIS_TTL, value: "2592000"}
+        - {name: KERNEL_ARCHIVE_MAX_BYTES, value: "67108864"}
+        - {name: KERNEL_ARCHIVE_FILES, value: "5"}
+        - {name: KERNEL_DISCOVERY_INTERVAL_SECONDS, value: "5"}
+        readinessProbe:
+          exec: {command: [python3, /app/healthcheck.py]}
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+        volumeMounts:
+        - {name: runtime, mountPath: /run/agentic-kernel}
+        - {name: archive, mountPath: /var/log/agentic-kernel}
+        - {name: cgroup, mountPath: /sys/fs/cgroup, readOnly: true}
+        - {name: modules, mountPath: /lib/modules, readOnly: true}
+        - {name: source, mountPath: /usr/src, readOnly: true}
+        - {name: debugfs, mountPath: /sys/kernel/debug, readOnly: true}
+        - {name: tracefs, mountPath: /sys/kernel/tracing, readOnly: true}
+      volumes:
+      - name: runtime
+        hostPath: {path: /run/agentic-kernel, type: DirectoryOrCreate}
+      - name: archive
+        hostPath: {path: /var/log/agentic-kernel, type: DirectoryOrCreate}
+      - name: cgroup
+        hostPath: {path: /sys/fs/cgroup, type: Directory}
+      - name: modules
+        hostPath: {path: /lib/modules, type: Directory}
+      - name: source
+        hostPath: {path: /usr/src, type: DirectoryOrCreate}
+      - name: debugfs
+        hostPath: {path: /sys/kernel/debug, type: DirectoryOrCreate}
+      - name: tracefs
+        hostPath: {path: /sys/kernel/tracing, type: DirectoryOrCreate}

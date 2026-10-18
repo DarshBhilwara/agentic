@@ -7,6 +7,7 @@ import signal
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Literal, TypedDict
@@ -18,6 +19,7 @@ from telemetry import (event_counter, handoff_counter, inference_counter, inject
                        tool_calls as tool_call_metric, tool_duration, tool_wait)
 from program_telemetry import ProgramTelemetry, TaskTimeout, StepLimitExceeded, collect_engine_metrics
 from telemetry_ledger import TelemetryLedger
+from collection_policy import program_capture_enabled, semantic_capture_enabled
 
 MODEL_NAME = os.getenv("AGENT_MODEL_NAME", "qwen")
 DEFAULT_VLLM_URL = "http://vllm-service:8000/v1"
@@ -159,7 +161,14 @@ def _emit(event_type, *, attributes=None, payload=None, severity="info", **extra
     context = RUNTIME_CONTEXT.get()
     if not context or not context.get("event_sink"):
         return None
-    event_counter.add(1, {"event.type": event_type})
+    from collection_policy import (detailed_capture_enabled, is_lifecycle_event, is_semantic_event,
+                                   program_capture_enabled, semantic_capture_enabled)
+    if not detailed_capture_enabled() and not is_lifecycle_event(event_type):
+        return None
+    if not semantic_capture_enabled() and is_semantic_event(event_type):
+        return None
+    if program_capture_enabled() or is_lifecycle_event(event_type):
+        event_counter.add(1, {"event.type": event_type})
     return context["event_sink"](
         event_type,
         attributes={"program_id": context["task_id"], **(attributes or {})},
@@ -434,8 +443,9 @@ def delegate_to_agent(args: Dict, _workspace: str) -> str:
     child_run_id = str(uuid.uuid4())
     handoff_id = str(uuid.uuid4())
     redis_client = context["redis"]
-    TelemetryLedger(redis_client).link_delegation(context["run_id"], child_run_id,
-                                                   context["user"], handoff_id)
+    if semantic_capture_enabled():
+        TelemetryLedger(redis_client).link_delegation(context["run_id"], child_run_id,
+                                                       context["user"], handoff_id)
     redis_client.hset(f"task:{child_task_id}", mapping={
         "id": child_task_id,
         "user": context["user"],
@@ -464,7 +474,8 @@ def delegate_to_agent(args: Dict, _workspace: str) -> str:
     pipe.zadd("task_deadlines", {child_task_id: time.time() + context.get("timeout_seconds", 1800)})
     pipe.lpush("task_queue", child_task_id)
     pipe.execute()
-    handoff_counter.add(1, {"agent.name": name})
+    if semantic_capture_enabled():
+        handoff_counter.add(1, {"agent.name": name})
     _emit(
         "agent.delegated",
         attributes={"handoff.to": child_agent_id, "agent.target.name": name},
@@ -622,7 +633,8 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
             with span("agent.inference", model=MODEL_NAME,
                       **{"openinference.span.kind": "LLM",
                          "llm.model_name": MODEL_NAME, **attrs}) as inference_span:
-                inference_counter.add(1, {"model": MODEL_NAME})
+                if program_capture_enabled():
+                    inference_counter.add(1, {"model": MODEL_NAME})
                 request_messages = state["messages"]
                 _emit("model.requested", attributes=attrs,
                       payload={"messages": safe_payload(request_messages)})
@@ -893,7 +905,11 @@ def _execute_tool(call, workspace, record, tools, *, tool_index=1, step_acting_s
     # fields intentionally retain raw content; protected modes retain only
     # redacted text or hash/length metadata.
     safe_arguments = _otel_content(call["arguments"])
-    with span("agent.tool", **{"openinference.span.kind": "TOOL",
+    kernel = getattr(record, "kernel", None)
+    scope = kernel.scope(program_id=record.program_id, step_index=record.step_index,
+                         tool_name=call["name"], tool_index=tool_index,
+                         tool_call_id=call["id"]) if hasattr(kernel, "scope") else nullcontext()
+    with scope, span("agent.tool", **{"openinference.span.kind": "TOOL",
                               "tool.name": call["name"],
                               "tool.parameters": safe_arguments,
                               "input.value": safe_arguments, **attrs}) as current:
@@ -929,10 +945,11 @@ def _execute_tool(call, workspace, record, tools, *, tool_index=1, step_acting_s
                         "tool_latency_ms": (time.perf_counter() - started) * 1000}
             latency = measured["tool_latency_ms"]
             record.tools.append(measured)
-            tool_call_metric.add(1, {"tool_name": call["name"], "tool_status": status})
-            tool_duration.record(measured["tool_latency_ms"], {"tool_name": call["name"], "tool_status": status})
-            if tool_ttf_ms is not None:
-                tool_wait.record(tool_ttf_ms, {"tool_name": call["name"]})
+            if program_capture_enabled():
+                tool_call_metric.add(1, {"tool_name": call["name"], "tool_status": status})
+                tool_duration.record(measured["tool_latency_ms"], {"tool_name": call["name"], "tool_status": status})
+                if tool_ttf_ms is not None:
+                    tool_wait.record(tool_ttf_ms, {"tool_name": call["name"]})
             for key, value in measured.items():
                 current.set_attribute(key, value)
             current.set_attribute(

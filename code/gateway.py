@@ -8,9 +8,12 @@ from fastapi import FastAPI, Depends, HTTPException, Header
 from telemetry import inject_context, redact_text, safe_content, safe_payload, span, task_counter
 from telemetry_ledger import TelemetryLedger
 from program_telemetry import ProgramTelemetry
+from console_api import attach_console
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
-r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis-service:6379/0"))
+r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis-service:6379/0"), socket_connect_timeout=1, socket_timeout=1)
 ledger = TelemetryLedger(r)
 
 
@@ -200,6 +203,40 @@ def get_telemetry_run(run_id: str, offset: int = 0, limit: int = 200, user: str 
             "procedural_graph": ledger.graph(run_id)}
 
 
+@app.get("/telemetry/runs/{run_id}/kernel")
+def get_kernel_telemetry(run_id: str, offset: int = 0, limit: int = 200,
+                         user: str = Depends(verify_key)):
+    """Return the bounded raw syscall stream, separate from the event ledger."""
+    run = ledger.run(run_id)
+    if not run or run.get("user.id") != user:
+        raise HTTPException(404, detail="Telemetry run not found")
+    if offset < 0 or not 1 <= limit <= 500:
+        raise HTTPException(400, detail="offset must be nonnegative and limit must be 1..500")
+    key = f"kernel:run:{run_id}"
+    rows = r.lrange(key, offset, offset + limit - 1)
+    status = r.hgetall(f"{key}:status")
+    status = {k.decode(): v.decode() for k, v in status.items()}
+    total = int(status.get("events", 0))
+    retained = int(r.llen(key))
+    node_health = {}
+    node = status.get("node")
+    if node:
+        health = r.hgetall(f"kernel:node:{node}:status")
+        node_health = {k.decode(): v.decode() for k, v in health.items()}
+        heartbeat = float(node_health.get("heartbeat_unix", 0) or 0)
+        age = max(0, time.time() - heartbeat) if heartbeat else None
+        node_health["heartbeat_age_seconds"] = age
+        node_health["heartbeat_ok"] = age is not None and age <= 20
+        for name in ("perf_lost", "map_overflow", "queue_drops", "export_errors", "discovery_errors", "identity_misses"):
+            if name in node_health:
+                status[name] = node_health[name]
+    return {"records": [json.loads(row) for row in rows], "offset": offset,
+            "limit": limit, "total": total, "retained": retained,
+            "truncated": total > retained,
+            "status": {k: (int(v) if k in {"events", "perf_lost", "map_overflow", "queue_drops", "discovery_errors", "identity_misses", "export_errors"} else v)
+                       for k, v in status.items()}, "node_health": node_health}
+
+
 @app.get("/telemetry/programs/{program_id}")
 def get_program(program_id: str, user: str = Depends(verify_key)):
     task = get_task(program_id, user=user)
@@ -225,3 +262,13 @@ def ingest_telemetry_event(event: dict, user: str = Depends(verify_key)):
                       for key, value in (event.get("attributes") or {}).items()}
     return ledger.emit(event_type, run_id=run_id, attributes=attributes,
                        payload=safe_payload(event.get("payload")), severity=event.get("severity", "info"), **identity)
+
+
+attach_console(app, verify_key, lambda: r, lambda: ledger)
+
+@app.get("/", include_in_schema=False)
+def console_home():
+    return RedirectResponse("/dashboard/")
+
+if os.path.isdir(os.path.join(os.path.dirname(__file__), "static")):
+    app.mount("/dashboard", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="dashboard")

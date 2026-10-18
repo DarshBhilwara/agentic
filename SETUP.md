@@ -1,10 +1,16 @@
 # Deployment setup
 
-This deployment has three Kubernetes layers:
+For the browser console, local startup, collection controls, device discovery,
+and report export, see [GUI.md](GUI.md). The gateway serves `/dashboard/`.
+Console manifest previews are deployment drafts and require a later rollout.
+
+The combined cluster uses these Kubernetes manifests:
 
 | Manifest | Placement | Responsibility |
 | --- | --- | --- |
 | `platform.yaml` | Every cluster node | Namespace, NVIDIA device plugin, and node/process telemetry |
+| `console-access.yaml` | Gateway service account | Read-only node and namespace pod discovery permissions |
+| `kernel-telemetry.yaml` | Workload nodes | Privileged eBPF syscall collector and node archives |
 | `telemetry.yaml` | Telemetry-capable cluster | Shared OTLP Collector, Phoenix, and Prometheus |
 | `agent-node.yaml` | Smaller agent server | API gateway, Redis, and agent workers |
 | `inference-node.yaml` | GPU inference server | vLLM and the model cache |
@@ -59,14 +65,16 @@ differ; applying a manifest does not migrate existing ephemeral Redis data.
 
 ## Build and render for the existing two-node cluster
 
-Build both images from `/home/agentic/agentic`, then make the worker image available
-on the agent node and the vLLM image on the inference node. The worker image
+Build the images from `/home/agentic/agentic`, then make the worker image available
+on the agent node, the vLLM image on the inference node, and the kernel
+collector image on both nodes. The worker image
 installs `requirements.txt`, including LangGraph. These are custom
 images: the stock vLLM image alone cannot provide the per-request adapter.
 
 ```sh
 docker build -t agentic-worker:0.1 .
 docker build -t agentic-vllm:0.1 -f inference/Dockerfile .
+docker build -t agentic-kernel:0.1 -f kernel/Dockerfile .
 ```
 
 Push to your registry and update the image names, or save/import images into
@@ -116,7 +124,10 @@ All application and host telemetry enters through the internal service `otel-col
 
 1. The worker runs each task as a LangGraph `model -> tools -> model` state graph and emits agent intent, tool-call, task, inference, artifact, and handoff spans.
 2. `otel-node-collector` runs on every node and emits CPU, memory, disk, filesystem, network, process, and process-state metrics.
-3. vLLM emits inference traces and its Prometheus metrics are scraped by the Collector.
+3. The privileged kernel collector captures syscall events on selected workload
+   cgroups. Follow [kernel prerequisites and smoke checks](kernel/README.md)
+   before running experiments with kernel capture enabled.
+4. vLLM emits inference traces and its Prometheus metrics are scraped by the Collector.
 
 The Collector sends traces to Phoenix, metrics to Prometheus remote write, and application logs to persistent Loki storage. In parallel, the gateway and workers maintain a Redis-backed execution ledger. The ledger is the durable record for dynamic multi-agent work; it does not orchestrate execution. The worker orchestrates each queued task with its LangGraph state graph. Every run is keyed by `run.id` and carries `user.id`, `session.id`, `task.id`, `agent.id`, `agent.run.id`, and optional `agent.parent.run.id`.
 
@@ -124,11 +135,7 @@ Loki is internal to the cluster. To inspect logs locally, use `kubectl -n agenti
 
 The native agent exposes `delegate_to_agent` and `check_delegated_task` as dynamic tools. A delegated agent becomes a queued child task with its own agent/run identity and a shared root-run identity. Framework integrations can create or query runs through `POST /telemetry/events` without using these tools.
 
-For a separate agents-only K3s deployment that calls an external vLLM endpoint,
-see [`agents-cluster/README.md`](agents-cluster/README.md). It retains worker,
-gateway, and Redis telemetry but does not collect local vLLM engine telemetry.
-
-The default ledger policy retains 30 days and keeps the most recent 10,000 events per run. Both supplied deployment modes use `full` capture for research: raw prompts, model responses, tool arguments/results, event payloads, and string attributes are persisted without redaction or truncation. Treat Redis, Loki, Phoenix, and Prometheus as sensitive research storage. `redacted` mode remains available if you modify the manifests.
+The default ledger policy retains 30 days and keeps the most recent 10,000 events per run. The supplied deployment uses `full` capture for research: raw prompts, model responses, tool arguments/results, event payloads, and string attributes are persisted without redaction or truncation. Treat Redis, Loki, Phoenix, and Prometheus as sensitive research storage. `redacted` mode remains available if you modify the manifests.
 
 ```text
 AGENT_TELEMETRY_CONTENT_CAPTURE=off|redacted|full
@@ -136,8 +143,8 @@ AGENT_TELEMETRY_RETENTION_SECONDS=2592000
 AGENT_TELEMETRY_MAX_EVENTS_PER_RUN=10000
 ```
 
-Use `full` only for trusted, access-controlled evaluation environments. Both
-deployments enable it explicitly for research, so their Redis, Loki, Phoenix,
+Use `full` only for trusted, access-controlled evaluation environments. The
+deployment enables it explicitly for research, so its Redis, Loki, Phoenix,
 and Prometheus data can include credentials or private code.
 
 The default externally exposed services are:
@@ -155,7 +162,9 @@ Apply the platform first because it creates the namespace. Then apply the shared
 
 ```sh
 kubectl apply -f build/manifests/platform.yaml
+kubectl apply -f build/manifests/console-access.yaml
 kubectl apply -f build/manifests/telemetry.yaml
+kubectl apply -f build/manifests/kernel-telemetry.yaml
 kubectl apply -f build/manifests/agent-node.yaml
 kubectl apply -f build/manifests/inference-node.yaml
 ```
@@ -166,6 +175,7 @@ Check the rollout:
 kubectl -n agentic-ai get pods -o wide
 kubectl -n agentic-ai get svc
 kubectl -n agentic-ai logs deploy/otel-collector-gateway
+kubectl -n agentic-ai rollout status daemonset/kernel-telemetry
 kubectl -n agentic-ai logs deploy/agent-worker
 kubectl -n agentic-ai logs deploy/vllm
 ```
@@ -271,6 +281,9 @@ Outputs:
 - `programs.jsonl`: one program summary per instance attempt, suitable for analysis.
 - `<case-hash>/submission.json`: program/run identity saved immediately for recovery.
 - `<case-hash>/summary.json`, `steps.json`, `events.jsonl`, `run.json`: structured measurements and traces.
+- `<case-hash>/kernel.jsonl`, `kernel-status.json`: the retained syscall records
+  and capture status at export time. Kernel export is asynchronous; this is a
+  snapshot, and bounded retention or capture loss must be checked in the status.
 - `<case-hash>/model.patch`, `prediction.json`: generated patch, including new files.
 - `predictions.json`: combined `{instance_id, patch, prefix}` predictions for the upstream v1 evaluator format.
 

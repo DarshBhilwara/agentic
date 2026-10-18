@@ -95,6 +95,18 @@ def export_trace(request, run_id, destination):
                 break
     (destination / "steps.json").write_text(json.dumps(data["steps"], indent=2))
     (destination / "run.json").write_text(json.dumps(data["run"], indent=2))
+    offset = 0
+    with (destination / "kernel.jsonl").open("w") as records:
+        while True:
+            kernel = request("GET", f"/telemetry/runs/{run_id}/kernel",
+                             params={"offset": offset, "limit": 500})
+            for event in kernel["records"]:
+                records.write(json.dumps(event) + "\n")
+            offset += len(kernel["records"])
+            if len(kernel["records"]) < 500:
+                break
+    (destination / "kernel-status.json").write_text(json.dumps(
+        {key: value for key, value in kernel.items() if key != "records"}, indent=2))
     return data["summary"]
 
 

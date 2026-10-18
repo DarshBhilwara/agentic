@@ -2,9 +2,14 @@
 
 A Kubernetes-based autonomous-agent platform with per-user workspaces, a
 LangGraph worker runtime, and an execution ledger backed by OpenTelemetry and
-Redis. It supports the original single Kubernetes cluster with separate agent and
-inference nodes, or a standalone agents-only cluster that uses an external
-vLLM API.
+Redis. It uses one Kubernetes cluster with separate agent and inference nodes.
+Telemetry combines program measurements, semantic execution events, and an
+eBPF syscall layer. See [the overall plan](TELEMETRY_PLAN.md) for scope and
+the [telemetry console guide](GUI.md) for the configuration and reporting GUI.
+
+The gateway serves the console at `/dashboard/`. It offers collection drafts,
+manifest previews, device/run inspection, and reports. It supports a labelled
+demo mode when no platform is running; it never applies Kubernetes changes.
 
 The current experiment is **program-level agent telemetry on SWE-bench Pro**:
 one dataset instance attempt is one program, with inference-step counts,
@@ -28,35 +33,15 @@ The components are split across manifests:
 
 - [`manifests/platform.yaml`](manifests/platform.yaml) is the cluster-wide layer. It installs the namespace, NVIDIA device plugin, and a node telemetry DaemonSet.
 - [`manifests/telemetry.yaml`](manifests/telemetry.yaml) installs the shared OpenTelemetry Collector, Phoenix, Prometheus, and persistent Loki log storage.
+- [`manifests/kernel-telemetry.yaml`](manifests/kernel-telemetry.yaml) installs
+  the eBPF syscall collector on the agent and inference nodes.
 - [`manifests/agent-node.yaml`](manifests/agent-node.yaml) runs the gateway, Redis, and workers on nodes labelled `agentic.io/role=agent`.
 - [`manifests/inference-node.yaml`](manifests/inference-node.yaml) runs vLLM
   on nodes labelled `agentic.io/role=inference`.
 
-The existing manifests remain the single-cluster deployment. To run agents in
-a separate K3s cluster while using this cluster's externally reachable vLLM,
-use the [standalone agents-cluster deployment](agents-cluster/README.md).
-
-### Deployment modes
-
-| Mode | What runs locally | Inference endpoint | Telemetry scope |
-| --- | --- | --- | --- |
-| Existing single cluster | Agents, telemetry stack, and vLLM on separately labelled nodes | Internal `vllm-service:8000/v1` | Agent and vLLM engine telemetry, including Redis-backed engine-measurement joins |
-| Standalone agents cluster | Gateway, workers, Redis, reaper, workspace storage, and OTLP Collector | External vLLM plus Phoenix and Prometheus endpoints in `agent-inference` | Agent ledger, traces, metrics, and client-side inference duration; external vLLM engine measurements are not joined locally |
-
-For the agents-only mode, render the manifest with the reachable OpenAI-compatible
-endpoint (for example `http://<inference-host>:30800/v1`):
-
-```sh
-python3 agents-cluster/render_manifests.py \
-  --vllm-url http://<inference-host>:30800/v1
-```
-
-The resulting `agent-inference` ConfigMap is mounted into every worker. The
-worker image installs its LangGraph dependency from `requirements.txt`. To
-redirect all future agent runs, update its `AGENT_VLLM_URL` value; projected
-ConfigMap changes can take roughly two minutes to appear in running pods. See
-the [agents-only deployment guide](agents-cluster/README.md) for image import,
-credentials, and deployment steps.
+The combined cluster provides a shared Redis ledger and exact request-ID joins
+for inference-engine measurements. Kernel collection runs separately on both
+workload nodes; see [kernel setup and validation](kernel/README.md).
 
 ### Agent orchestration
 
@@ -107,8 +92,10 @@ Telemetry combines:
 2. **OpenTelemetry** - correlated traces, metrics, and OTLP log intake for agent and infrastructure signals.
 3. **Process and hardware state** - host CPU, load, memory, disk, filesystem, network, process, and process-state metrics.
 4. **Inference engine** - vLLM request traces and native metrics.
+5. **Kernel syscalls** - eBPF entry/exit records, separated from the bounded
+   semantic ledger and correlated with execution scopes where known.
 
-Both supplied research deployments set `AGENT_TELEMETRY_CONTENT_CAPTURE=full`, preserving raw prompt, response, tool, and event content without redaction or truncation. Use them only on access-controlled, non-production infrastructure because telemetry may contain secrets.
+The research deployment sets `AGENT_TELEMETRY_CONTENT_CAPTURE=full`, preserving raw prompt, response, tool, and event content without redaction or truncation. Use it only on access-controlled, non-production infrastructure because telemetry may contain secrets.
 
 Inspect any submitted run through the gateway:
 
@@ -124,7 +111,9 @@ The normal deployment order is:
 
 ```sh
 kubectl apply -f build/manifests/platform.yaml
+kubectl apply -f build/manifests/console-access.yaml
 kubectl apply -f build/manifests/telemetry.yaml
+kubectl apply -f build/manifests/kernel-telemetry.yaml
 kubectl apply -f build/manifests/agent-node.yaml
 kubectl apply -f build/manifests/inference-node.yaml
 ```

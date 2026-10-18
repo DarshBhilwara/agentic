@@ -14,8 +14,10 @@ from agent import run
 from program_telemetry import ProgramTelemetry, TaskTimeout
 from telemetry import (parent_context, safe_content, span, task_counter,
                        set_error_status, task_error_counter, program_duration,
-                       program_queue, program_steps)
+                       program_queue, program_steps, trace_identity)
 from telemetry_ledger import TelemetryLedger, now
+from kernel_telemetry import kernel_telemetry_from_env
+from collection_policy import program_capture_enabled
 
 
 @contextmanager
@@ -62,7 +64,8 @@ def process_task(r, task_id):
         ledger.save_summary(run_id, measurements.summary())
         emit("step.started" if step["step_status"] == "Running" else "step.completed", attributes=step)
 
-    measurements = ProgramTelemetry(task_id, task_wait_time_ms=wait_ms, on_step=save_step)
+    kernel = kernel_telemetry_from_env()
+    measurements = ProgramTelemetry(task_id, task_wait_time_ms=wait_ms, on_step=save_step, kernel=kernel)
     r.hset(f"task:{task_id}", mapping={"status": "processing", "task_status": "Running", "started_at": now()})
     ledger.save_summary(run_id, measurements.summary())
     status, result, error = "Failed", "", ""
@@ -71,7 +74,12 @@ def process_task(r, task_id):
             emit("task.started", attributes={"task_wait_time_ms": wait_ms})
             try:
                 timeout_seconds = float(task.get("timeout_seconds", 1800))
-                with task_deadline(timeout_seconds - wait_ms / 1000):
+                with task_deadline(timeout_seconds - wait_ms / 1000), kernel.scope(
+                        run_id=run_id, program_id=task_id, task_id=task_id,
+                        root_run_id=identity["root.run.id"], session_id=session_id,
+                        agent_id=identity["agent.id"], agent_run_id=identity["agent.run.id"],
+                        trace_id=trace_identity().get("trace.id"),
+                        span_id=trace_identity().get("span.id")):
                     conversation_key = f"session:{session_id}:agent:{identity['agent.id']}:messages"
                     stored = r.get(conversation_key)
                     workspace = task.get("workspace", f"/workspace/users/{user}")
@@ -121,9 +129,10 @@ def process_task(r, task_id):
                 if status != "Success":
                     set_error_status(current, status)
                 labels = {"task_status": status, "benchmark": task.get("benchmark", "")}
-                program_duration.record(elapsed_ms, labels)
-                program_queue.record(wait_ms, labels)
-                program_steps.record(summary["inference_steps"], labels)
+                if program_capture_enabled():
+                    program_duration.record(elapsed_ms, labels)
+                    program_queue.record(wait_ms, labels)
+                    program_steps.record(summary["inference_steps"], labels)
                 for key, value in summary.items():
                     if value is not None:
                         current.set_attribute(key, value)

@@ -88,8 +88,11 @@ spec:
         - {name: AGENT_TELEMETRY_CONTENT_CAPTURE, value: full}
         - {name: AGENT_TELEMETRY_RETENTION_SECONDS, value: "2592000"}
         - {name: AGENT_TELEMETRY_MAX_EVENTS_PER_RUN, value: "10000"}
-        volumeMounts: [{name: workspace, mountPath: /workspace}, {name: agent-workspaces, mountPath: /agent-workspaces}]
-      volumes: [{name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}, {name: agent-workspaces, hostPath: {path: /home/agentic/agentic, type: Directory}}]
+        - {name: KERNEL_TELEMETRY_ENABLED, value: "true"}
+        - {name: KERNEL_INFERENCE_SYSCALLS_ENABLED, value: "true"}
+        - {name: KERNEL_TELEMETRY_SOCKET, value: /run/agentic-kernel/collector.sock}
+        volumeMounts: [{name: workspace, mountPath: /workspace}, {name: agent-workspaces, mountPath: /agent-workspaces}, {name: kernel-runtime, mountPath: /run/agentic-kernel}]
+      volumes: [{name: workspace, persistentVolumeClaim: {claimName: agentic-workspace}}, {name: agent-workspaces, hostPath: {path: /home/agentic/agentic, type: Directory}}, {name: kernel-runtime, hostPath: {path: /run/agentic-kernel, type: DirectoryOrCreate}}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -100,6 +103,7 @@ spec:
   template:
     metadata: {labels: {app: api-gateway}}
     spec:
+      serviceAccountName: agentic-console
       nodeSelector: {agentic.io/role: agent}
       topologySpreadConstraints:
       - maxSkew: 1
@@ -113,6 +117,7 @@ spec:
         workingDir: /app
         command: [uvicorn, gateway:app, --host, 0.0.0.0, --port, "8000"]
         env:
+        - {name: CONSOLE_K8S_DISCOVERY, value: "false"}
         - name: AGENT_API_KEYS
           valueFrom:
             secretKeyRef:

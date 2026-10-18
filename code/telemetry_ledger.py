@@ -51,10 +51,16 @@ class TelemetryLedger:
         self.redis.expire(f"telemetry:run:{run_id}", EVENT_TTL_SECONDS)
 
     def save_summary(self, run_id, summary):
+        from collection_policy import program_capture_enabled
+        if not program_capture_enabled():
+            return
         self.redis.hset(f"telemetry:run:{run_id}", "summary", json.dumps(summary))
         self.redis.expire(f"telemetry:run:{run_id}", EVENT_TTL_SECONDS)
 
     def save_step(self, run_id, step):
+        from collection_policy import program_capture_enabled
+        if not program_capture_enabled():
+            return
         key = f"telemetry:run:{run_id}:steps"
         self.redis.hset(key, str(step["step_index"]), json.dumps(step))
         self.redis.expire(key, EVENT_TTL_SECONDS)
@@ -64,6 +70,23 @@ class TelemetryLedger:
         return [json.loads(raw[key]) for key in sorted(raw, key=int)]
 
     def emit(self, event_type, *, run_id, attributes=None, payload=None, severity="info", **identity):
+        from collection_policy import (PROGRAM_EVENT_TYPES, detailed_capture_enabled,
+                                       is_lifecycle_event, is_semantic_event, program_capture_enabled,
+                                       semantic_capture_enabled)
+        minimal_lifecycle = not detailed_capture_enabled() and is_lifecycle_event(event_type)
+        if not detailed_capture_enabled() and not minimal_lifecycle:
+            return {"id": "", "type": event_type, "run.id": run_id, "suppressed": True}
+        if not program_capture_enabled() and event_type in PROGRAM_EVENT_TYPES:
+            return {"id": "", "type": event_type, "run.id": run_id, "suppressed": True}
+        if not semantic_capture_enabled() and is_semantic_event(event_type):
+            return {"id": "", "type": event_type, "run.id": run_id, "suppressed": True}
+        if minimal_lifecycle:
+            allowed_identity = {"user.id", "session.id", "task.id", "agent.id", "agent.run.id", "agent.parent.run.id",
+                                "root.run.id", "parent.task.id", "parent.run.id", "handoff.id", "trace.id", "span.id", "program_id"}
+            identity = {k: v for k, v in identity.items() if k in allowed_identity}
+            allowed_attributes = {"task_status", "status", "task_wait_time_ms", "task_completion_time_ms", "elapsed_ms"}
+            attributes = {k: v for k, v in (attributes or {}).items() if k in allowed_attributes and isinstance(v, (str, int, float, bool))}
+            payload = None
         event = {
             "id": str(uuid.uuid4()),
             "schema_version": LEDGER_VERSION,
@@ -90,8 +113,8 @@ class TelemetryLedger:
             terminal = event_type in {"task.completed", "task.failed", "task.timeout"}
             export_ledger_event(
                 event,
-                procedural_graph=self.graph(run_id) if terminal else None,
-                summary=(self.run(run_id) or {}).get("summary") if terminal else None,
+                procedural_graph=self.graph(run_id) if terminal and not minimal_lifecycle else None,
+                summary=(self.run(run_id) or {}).get("summary") if terminal and not minimal_lifecycle else None,
             )
         except Exception:
             # Export outages must not interrupt task execution or durable writes.

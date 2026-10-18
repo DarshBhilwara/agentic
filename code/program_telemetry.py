@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import time
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 
 from telemetry import span, inference_step_duration
+from collection_policy import program_capture_enabled
 
 
 class TaskTimeout(TimeoutError):
@@ -63,20 +64,23 @@ class StepRecord:
 
 
 class ProgramTelemetry:
-    def __init__(self, program_id, *, task_wait_time_ms=0, on_step=None):
+    def __init__(self, program_id, *, task_wait_time_ms=0, on_step=None, kernel=None):
         self.program_id = program_id
         self.task_wait_time_ms = task_wait_time_ms
         self.on_step = on_step
+        self.kernel = kernel
         self.steps = []
 
     @contextmanager
     def step(self, index):
         record = StepRecord(self.program_id, index)
+        record.kernel = self.kernel
         self.steps.append(record)
         started = time.perf_counter()
-        if self.on_step:
+        if self.on_step and program_capture_enabled():
             self.on_step(asdict(record))
-        with span("agent.step", program_id=self.program_id, step_index=index) as current:
+        scope = self.kernel.scope(program_id=self.program_id, step_index=index) if self.kernel else nullcontext()
+        with scope, span("agent.step", program_id=self.program_id, step_index=index) as current:
             try:
                 yield record
                 record.step_status = "Success"
@@ -88,14 +92,14 @@ class ProgramTelemetry:
                 raise
             finally:
                 record.step_time_ms = (time.perf_counter() - started) * 1000
-                inference_step_duration.record(record.step_time_ms, {"step_status": record.step_status})
+                if program_capture_enabled():
+                    inference_step_duration.record(record.step_time_ms, {"step_status": record.step_status})
                 values = asdict(record)
                 for key, value in values.items():
-                    if value is not None and key != "tools":
+                    if program_capture_enabled() and value is not None and key != "tools":
                         current.set_attribute(key, value)
-                if self.on_step:
+                if self.on_step and program_capture_enabled():
                     self.on_step(values)
-
     def summary(self, status="Running", completion_time_ms=None):
         def total(name):
             values = [getattr(step, name) for step in self.steps]

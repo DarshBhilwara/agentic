@@ -12,4 +12,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY code /app
+COPY manifests /app/manifests
+COPY code/static /app/static
 CMD ["python", "worker.py"]

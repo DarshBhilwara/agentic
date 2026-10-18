@@ -30,7 +30,7 @@ spec:
   strategy: {type: Recreate}
   selector: {matchLabels: {app: vllm}}
   template:
-    metadata: {labels: {app: vllm}}
+    metadata: {labels: {app: vllm, telemetry.agentic.io/syscalls: enabled}}
     spec:
       nodeSelector: {agentic.io/role: inference}
       runtimeClassName: nvidia
