@@ -1,6 +1,7 @@
 k3s-data
 model-cache
 workspace
+plan.md
 __pycache__
 .pytest_cache/
 .venv/
