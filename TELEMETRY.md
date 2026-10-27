@@ -1,192 +1,133 @@
 # Telemetry Contract
 
-## Collection architecture
+## Implemented telemetry at a glance
 
-In the full single-cluster deployment, task execution and telemetry flow as
-follows:
+The manifests and runtime code configure these telemetry layers. This inventory describes implementation paths; it does not assert that a particular cluster deployment is healthy or currently exporting data.
+
+| Layer | Measures or records | Storage / destination | How to inspect |
+| --- | --- | --- | --- |
+| Program | Task status/timing, inference steps, tools, token use, benchmark identity | Redis run summaries and steps; OTLP | `/telemetry/programs/{program_id}`, `/telemetry/runs/{run_id}`, Phoenix, Prometheus |
+| Semantic execution | Agent decisions, LangGraph nodes, handoffs, artifacts, procedural graphs | Redis event ledger and graph; OTLP | Run APIs, Phoenix, `/dashboard/` |
+| Inference engine | Request timing, tokens, queue wait, batch-attributed model-forward time; native vLLM metrics | Request-ID join into Redis steps; Prometheus scrape | Run/program APIs, Prometheus |
+| Host infrastructure | Host CPU, load, memory, network, disk, filesystem, process metrics | OTLP metrics to Prometheus remote write | Prometheus |
+| Application logs | Python application log records when OTLP logging is configured | OTLP to Loki | Loki; see port-forward command below |
+| Kernel syscalls | Raw syscall entry/exit events for selected cgroups | Per-node JSONL archives; run-attributed Redis records | Authenticated kernel run endpoint; node archive |
+| Console/reports | Read-only device observations, run views, configuration previews and bounded snapshots | Gateway APIs; downloadable JSON/Markdown/CSV | `/dashboard/`, authenticated `/console` API |
 
 ```text
-gateway -> Redis task queue -> worker/LangGraph agent -> vLLM
-   |              |                |           |
-   +--------------+----------------+-----------+
-                  telemetry
-                      |
-       OpenTelemetry Collector -> Phoenix and Prometheus
+gateway -> Redis task queue/ledger -> worker/LangGraph agent -> vLLM
+               |                        |                  |
+               +--> authenticated APIs +---- OTLP --------+
+                                             Collector
+                                      Phoenix / Prometheus / Loki
+otel-node-collector DaemonSet -> host metrics -> Collector
+kernel-telemetry DaemonSet -> eBPF syscall events -> node archives + Redis
 ```
 
-The execution ledger and OpenTelemetry data carry the available collection
-identities: `user.id`, `session.id`, `task.id`, `run.id`, `root.run.id`,
-`agent.id`, `agent.run.id`, `agent.parent.run.id`, `handoff.id`, `trace.id`,
-and `span.id`.
+## Shared execution model and identity
 
-Within a worker, every task follows the explicit LangGraph route
-`START -> model -> tools -> model -> END`. The conditional model edge goes to
-`tools` only when the model emits tool calls. Dynamic child-agent delegation
-still crosses the Redis task queue as an independent task, so it preserves
-causal identities without being represented as a fixed graph edge.
+- A queued task runs as a LangGraph graph: `START -> model -> tools -> model -> END`.
+- The model routes to tools only when it returns tool calls. Current tool calls execute sequentially.
+- Delegation queues a child task; it is dynamically linked to its parent by IDs and trace context, not a fixed graph edge.
+- Every run has `run.id`. These identities are attached when known:
 
-## Program-level benchmark measurements
+  ```text
+  user.id, session.id, task.id, run.id, root.run.id
+  agent.id, agent.run.id, agent.parent.run.id, handoff.id
+  trace.id, span.id
+  ```
 
-A **program** is one submitted task (one SWE-bench Pro instance attempt).
-`program_id` is the task UUID; `benchmark.case.id` / `instance_id` is the dataset
-identifier, and `run.id` links the event ledger. Repeated attempts at the same
-instance receive different program IDs. `step_index` starts at 1 for each
-program, independently of the interactive session turn number.
+- `agent.id` is the logical agent identity; `agent.run.id` identifies one invocation.
+- A child has its own task/run IDs, a parent agent-run ID, and the same root run ID as its initiating task.
+- `program_id` identifies one submitted program/task; `step_index` starts at 1 within that program and is separate from the session turn.
 
-One step is one LLM request, all tool calls selected by that request, and their
-returned observations. Tools currently execute sequentially. A final answer
-without tools is also one step. A failed LLM attempt counts as an inference
-step; SDK retries are disabled so attempts cannot disappear inside a step.
+## Program measurements
 
-`GET /telemetry/programs/{program_id}` or `GET /telemetry/runs/{run_id}` returns
-`summary`, `steps`, `run`, and a page of `events`. Times are numeric milliseconds;
-unknown measurements are JSON `null`, never fabricated zeroes.
+- **Program:** one submitted task; one SWE-bench Pro instance attempt.
+- **Repeated attempts:** distinct program and run IDs.
+- **Step:** one model request, its selected tool calls, and their observations.
+- **Final response:** counts as a step even without tools.
+- **Failed model attempts:** count as steps; SDK retries are disabled.
+- **Read APIs:** `GET /telemetry/programs/{program_id}` and `GET /telemetry/runs/{run_id}`.
+- **API contents:** run, summary, saved steps, procedural graph, and a bounded event page.
+- **Units:** milliseconds; unavailable measurements are `null`.
 
-| Field | Definition / measurement source |
+| Field | Definition and limits |
 | --- | --- |
-| `task_status` | `Queued`, `Running`, `Success`, `Failed`, or `Timeout`. Success means the agent returned normally, not that benchmark tests passed. |
-| `inference_steps` | Number of attempted model requests, including the final direct response and failed attempts. |
-| `completed_steps` | Steps that completed successfully. |
-| `task_completion_time_ms` | Submission-to-terminal-processing elapsed time, including queue wait; excludes checkout preparation and subsequent benchmark grading. Null while running. |
-| `task_wait_time_ms` | Submission to worker admission. Includes waiting behind other programs. |
-| `llm_inference_time_ms` | Per-step client request wall time, including inference queueing and transport. |
-| `step_t_reasoning_ms` | vLLM CUDA model-forward milliseconds accumulated for batches containing this request. Includes prefill and decode; **not exclusive per-request GPU occupancy**. |
-| `step_t_acting_ms` | Wall time for all tool execution and observation insertion in the step. Zero for no-tool steps. This is the total acting phase; per-tool `tool_ttf_ms` is the delay from that phase's start to an individual tool's start. |
-| `tools[].tool_name`, `tool_call_id`, `tool_index` | Tool identity and ordinal within the step. |
-| `tools[].tool_latency_ms`, `tool_ttf_ms`, `tool_status` | Total invocation duration, time from acting-phase start to tool start (TTF), and outcome. |
-| `prompt_tokens`, `completion_tokens`, `context_tokens` | Server usage; context is this request's accumulated prompt plus this response, not the sum of repeated prompts across requests. Tool observations enter the next request's prompt count. |
-| `prefill_time_ms` | Inference-node first scheduling to first generated token. A phase wall time, not isolated CUDA prefill kernel time. |
-| `decode_time_ms` | First generated token to request finish on the inference node. Zero is valid for a one-token completion. Includes interleaved scheduling/preemption. |
-| `inference_queue_time_ms` | Initial vLLM scheduling wait, distinct from the task queue on the agent node. |
-| `kv_recomputed_tokens` | Per-request recomputation tokens when supported by engine lifecycle attribution. Null in the shipped vLLM 0.8.5 V0 adapter. See limits below. |
+| `task_status` | `Queued`, `Running`, `Success`, `Failed`, or `Timeout`. `Success` means normal agent return, not passing benchmark tests. |
+| `inference_steps`, `completed_steps` | Attempted model requests; successfully completed steps. |
+| `task_completion_time_ms` | Submission to terminal processing, including queue wait; excludes checkout preparation and benchmark grading. Null while running. |
+| `task_wait_time_ms` | Submission to worker admission, including worker queue wait. |
+| `llm_inference_time_ms` | Client request wall time, including inference queueing and transport. |
+| `step_t_reasoning_ms` | vLLM CUDA model-forward time for batches containing the request. Includes prefill/decode; not exclusive per-request GPU occupancy. |
+| `step_t_acting_ms` | Wall time for tool calls and observation insertion; zero for no-tool steps. |
+| `tool_name`, `tool_call_id`, `tool_index` | Tool identity and order within the step. |
+| `tool_latency_ms`, `tool_ttf_ms`, `tool_status` | Tool duration, delay from acting-phase start to tool start, and `Success`/`Failed`/`Timeout` result. |
+| `prompt_tokens`, `completion_tokens`, `context_tokens` | Server usage. Context is current request prompt plus response, not repeated-prompt sum across requests. Tool observations count in the next request's prompt. |
+| `prefill_time_ms` | Inference-node first scheduling to first token; phase wall time, not isolated CUDA prefill kernels. |
+| `decode_time_ms` | First token to request finish; includes interleaved scheduling/preemption. Zero is valid for a one-token result. |
+| `inference_queue_time_ms` | Initial vLLM scheduling wait, separate from the agent task queue. |
+| `kv_recomputed_tokens` | Request-scoped recomputation when the engine exposes lifecycle attribution. Null in the shipped vLLM 0.8.5 V0 adapter. |
 
-Program summaries contain `total_llm_inference_time_ms`, `total_tool_time_ms`
-(sum of tool invocation durations), `total_tool_wait_time_ms`,
-`total_reasoning_time_ms`, `total_prefill_time_ms`, `total_decode_time_ms`,
-`total_inference_queue_time_ms`, `kv_recomputed_tokens`, token totals,
-`peak_context_tokens`, `tool_calls`, and `tool_failures`. An engine total is
-null if any constituent step lacks that measurement. `engine_measured_steps`
-reports how many request records were joined. GPU times are batch-attributed,
-so adding them across concurrent programs overcounts physical GPU occupancy.
-Phase times overlap inference wall time and must not be added to it.
+### Program summary fields
 
-The run also stores submission, start, and completion timestamps; task,
-session, agent, benchmark, and case identities; errors and results; and the
-termination reason when it is known. `Success` means the agent returned
-normally; it does not mean that a generated benchmark patch passed its tests.
+- **Model and tools:** `total_llm_inference_time_ms`, `total_tool_time_ms`, `total_tool_wait_time_ms`.
+- **Engine phases:** `total_reasoning_time_ms`, `total_prefill_time_ms`, `total_decode_time_ms`, `total_inference_queue_time_ms`.
+- **Usage:** token totals, `peak_context_tokens`, `tool_calls`, `tool_failures`.
+- **Engine availability:** `engine_measured_steps`; `kv_recomputed_tokens` remains null when unsupported.
 
-Step records and summaries are persisted separately from the bounded event
-tail. Program/step/request identifiers are span attributes and ledger fields,
-not high-cardinality Prometheus labels. Prometheus receives status/benchmark
-histograms for program duration, queue wait, and inference-step count.
+### Measurement limits
 
-### Agent decisions, tools, and artifacts
+- An engine total is null if any included step lacks the measurement.
+- Batch-attributed GPU times can overcount physical occupancy when summed across concurrent programs.
+- Phase times overlap inference wall time; do not add them to request time.
+- Run records include submission/start/completion timestamps, task/session/agent/benchmark/case IDs, result/error, and known termination reason.
+- Program/step/request IDs are span attributes and ledger fields, not high-cardinality Prometheus labels.
 
-After each model response, the runtime records the observable next-action
-decision: `agent.intent.decision` (`use_tool` or `respond_directly`),
-`agent.intent.tool_required`, `agent.intent.action`,
-`agent.intent.reason_code`, the primary `agent.intent.tool_name`, and the
-complete `agent.intent.tool_names` and aligned `agent.intent.tool_actions`.
-Action categories cover workspace inspection, file reads and writes, command
-execution, current-information retrieval, calculations, delegation,
-coordination, and direct response. These describe selected actions, not hidden
-reasoning.
+### Agent actions, tools, and artifacts
 
-Every tool invocation records its program and step identity, tool name,
-tool-call ID, start and completion events, `tool_latency_ms`, `tool_status`
-(`Success`, `Failed`, or `Timeout`), recorded exceptions, and bounded arguments
-and results subject to the content-capture policy. Successful `read_file` and
-`write_file` calls emit `artifact.read` and `artifact.written`; the worker also
-emits `artifact.written` for the final task-result file.
+After a model response, the runtime records the observable next action, not hidden reasoning:
 
-### Inference-node adapter
+- `agent.intent.decision`: `use_tool` or `respond_directly`.
+- `agent.intent.tool_required`, `agent.intent.action`, `agent.intent.reason_code`.
+- Primary `agent.intent.tool_name`, all `agent.intent.tool_names`, and aligned `agent.intent.tool_actions`.
+- Action categories include workspace inspection/read/write/command, current-information retrieval, calculations, delegation, coordination, and direct response.
+- Tool events carry program/step IDs, tool name/call ID, start/completion, duration, status, exception, and arguments/results subject to capture policy.
+- Successful `read_file`/`write_file` calls emit `artifact.read`/`artifact.written`; the worker also records the final task-result artifact.
 
-Build `inference/Dockerfile` and use the supplied inference manifest. It requires
-vLLM **0.8.5 V0**, prefix caching, one sequence per request, and detailed tracing.
-The worker sends W3C trace context and a unique `X-Request-Id` containing the
-program and step identity. The adapter records engine measurements under that
-exact request ID in Redis with a one-hour TTL; the worker joins them into the
-durable step. A bounded background queue keeps Redis I/O off the scheduler.
-Absent/late/dropped measurements stay null. Collection adds up to 0.5 seconds
-of join wait per missing record, included in task time but not model time.
+## Inference engine telemetry
 
-The shipped adapter does not expose request-scoped allocation/free/swap
-ownership. KV recomputation, retention, eviction, restoration, tier, residency,
-and affinity fields therefore remain null, including the first step. The
-adapter supplies an unavailable status/reason; prefix-hash overlap is not used
-as evidence of recomputation or eviction.
+The shipped adapter is pinned to vLLM **0.8.5 V0**, with prefix caching, one sequence per request, and detailed tracing. Revalidate it before upgrading vLLM.
 
-The implementation follows the pinned upstream
-[request timing fields](https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/sequence.py),
-[trace completion hook](https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/engine/llm_engine.py),
-and [prefix cache allocation](https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/core/block_manager.py).
-Do not upgrade vLLM without revalidating the adapter on the inference node.
+- Worker sends W3C trace context and a unique `X-Request-Id` containing program and step identity.
+- The adapter writes engine measurements under that exact request ID in Redis with a one-hour TTL; the worker joins them into the durable step.
+- A bounded background queue keeps Redis I/O off the scheduler.
+- Missing, late, or dropped measurements remain null. The join may wait up to 0.5 seconds for a missing record; that wait contributes to task time, not model time.
+- The adapter does not expose request-scoped KV allocation/free/swap ownership. KV recomputation, retention, eviction, restoration, tier, residency, and affinity remain null with an unavailable reason. Prefix-hash overlap is not treated as eviction or recomputation.
+- vLLM's native Prometheus endpoint is scraped by the gateway Collector every 15 seconds.
 
-### Failure and retention behavior
+Pinned implementation references: [request timing fields](https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/sequence.py), [trace completion hook](https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/engine/llm_engine.py), [prefix-cache allocation](https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/core/block_manager.py).
 
-The task deadline includes queue time. The worker interrupts timed-out tasks;
-command timeouts kill the shell's process group. Exceeding the step budget or
-receiving a truncated model response fails the program. A tool failure can be
-recovered by a later step without automatically failing the whole task.
+## Semantic events, graph, and external ingestion
 
-Queue claims move atomically into `task_processing`. A separate deadline
-reaper marks abandoned/overdue tasks Timeout after a 30-second grace period;
-it never reruns tools. Partial durations lost with a killed worker are unknown,
-and the summary has `timing_complete=false`. Reaper time is the observed
-terminal time, not a reconstructed crash timestamp. Normal timings use a
-monotonic clock for execution and agent-node wall time for queue admission.
+Native event families include:
 
-Redis uses AOF with `appendfsync everysec` and a persistent volume (up to one
-second of recent writes can be lost on abrupt failure). Phoenix and Prometheus
-also have persistent volumes. Local-path volumes survive pod replacement,
-not loss of the agent node's disk. This is a single-agent-node research setup.
+- Task lifecycle: `task.queued`, `task.started`, `task.completed`, `task.failed`, `task.timeout`.
+- Steps: `step.started`, `step.completed`.
+- Agent: `agent.started`, `agent.completed`, `agent.delegated`, and `agent.completion.rejected` when coding returns without required workspace changes.
+- Model/tool: `model.requested`, `model.completed`, `model.failed`, `tool.started`, `tool.completed`.
+- Artifacts: `artifact.read`, `artifact.written`.
+- Graph/phase/handoff and procedural graph events record observed execution structure and delegation.
 
-The execution ledger is an append-only event record for autonomous, dynamic
-multi-agent systems. It does not orchestrate execution or persist a LangGraph
-topology. The native worker's LangGraph graph governs a queued task; the ledger
-records its events and reconstructs dynamic delegation from run identities,
-parent agent invocations, handoff events, trace context, and timestamps.
+The procedural graph is materialized during execution, independently of the bounded event tail:
 
-## Identity
+- It records observed model, tool, delegation, and terminal nodes/edges.
+- Normalized action-path signatures index repeated procedures; small canonical action windows are stored as owner-scoped subgraph definitions and occurrences.
+- Handoffs add parent-to-child causal edges. The graph does not inspect hidden reasoning or judge task quality.
+- Terminal records and the graph span can carry final graph/summary snapshots. Phoenix shows the JSON in span details; it does not render a dedicated graph canvas.
+- Redacted mode masks graph strings; off mode fingerprints string values while preserving JSON structure.
 
-Every run has `run.id`. Events should include these fields whenever known:
-
-```text
-user.id
-session.id
-task.id
-agent.id
-agent.run.id
-agent.parent.run.id
-root.run.id
-handoff.id
-trace.id
-span.id
-```
-
-`agent.id` is a durable logical identity. `agent.run.id` identifies one
-invocation. A child agent has its own task and run IDs, an
-`agent.parent.run.id`, and the same `root.run.id` as its initiating task.
-
-## Event types
-
-The native runtime emits task lifecycle events (`task.queued`, `task.started`,
-`task.completed`, `task.failed`, and `task.timeout`); step lifecycle events
-(`step.started`, `step.completed`); agent events (`agent.started`,
-`agent.completed`, `agent.delegated`, and `agent.completion.rejected` for a
-coding task that returns without required workspace changes); model events
-(`model.requested`, `model.completed`, `model.failed`); tool events
-(`tool.started`, `tool.completed`); and artifact events (`artifact.read`,
-`artifact.written`).
-
-External runtimes may use these names and add a namespaced event type such as
-`langgraph.checkpoint.saved` or `custom.policy.decision`. Event payloads are
-for bounded, redacted diagnostic data; searchable dimensions belong in
-`attributes`.
-
-## External runtime ingestion
-
-Create a run first:
+External runtimes authenticate, create an owned run, then append events:
 
 ```json
 POST /telemetry/runs
@@ -201,8 +142,6 @@ POST /telemetry/runs
 }
 ```
 
-Then append events:
-
 ```json
 POST /telemetry/events
 {
@@ -215,164 +154,121 @@ POST /telemetry/events
 }
 ```
 
-The gateway authenticates every request, verifies run ownership, and replaces
-the supplied user identity with the authenticated user. In `redacted` mode,
-payload strings and external attributes are masked before storage; in the
-`full` research mode they are retained verbatim.
+- Gateway verifies ownership and assigns `user.id` from the authenticated token.
+- External event payloads may use known names or namespaced types such as `custom.policy.decision`.
+- In redacted mode, externally ingested payload strings and attributes are masked before storage; full mode retains them.
 
-## Retention and capture
+## OpenTelemetry traces, metrics, and logs
 
-The Redis ledger uses TTL-based retention and keeps a bounded tail per run.
-Defaults are 30 days and 10,000 events. Set
-`AGENT_TELEMETRY_CONTENT_CAPTURE=off` for hashes and lengths only,
-`redacted` for masked bounded content, or `full` only in a trusted evaluation
-environment.
+- Trace context propagates gateway → worker → vLLM and across queued delegation. Spans cover submission, program, agent, model, tool, and graph/node execution.
+- Phoenix/OpenInference span kinds: graph/node `CHAIN`, agent `AGENT`, model `LLM`, tool `TOOL`.
+- LLM spans expose numeric `llm.token_count.*` and corresponding `gen_ai.usage.*` attributes.
+- Each persisted ledger event is submitted best-effort as a child span, subject to semantic capture controls. Event spans include event ID/type/time/severity/schema, available identities, and structured attributes/payload. Error/fatal events get OTel error status. Export exceptions do not stop durable ledger writes or task execution.
+- Runtime metrics: `agent.tasks.total`, `agent.task.errors.total`, `agent.inference.requests.total`, `agent.telemetry.events.total`, `agent.handoffs.total`, `agent.program.duration`, `agent.program.queue.duration`, `agent.program.inference.steps`, `agent.inference.step.duration`, `agent.tool.duration`, `agent.tool.wait`, `agent.tool.calls.total`.
+- Python telemetry installs a root logging handler when OTLP log export is configured. This exports Python application log records; it does not scrape container stdout/stderr.
+- Gateway Collector routes OTLP traces to Phoenix, metrics to Prometheus remote write, and logs to Loki.
+- Phoenix and Loki exporters use file-backed sending queues. Prometheus uses `remote_write_queue` and a persistent write-ahead log (WAL); its exporter does not support `sending_queue`.
+- Export retries run for up to five minutes; buffering helps through brief outages but does not guarantee delivery.
+- Loki is internal: `kubectl -n agentic-ai port-forward service/loki-svc 3100:3100`.
 
-The supplied research deployment sets `full`. In that mode the
-Redis ledger retains raw prompt, model response, tool argument/result, event
-payload, and string attribute values, including full lists (no content
-redaction or truncation). OTLP span events additionally retain the exact model
-request/response and tool arguments/results. Every event accepted by the
-central execution ledger is also exported as an individual OTLP span with
-JSON-encoded structured attributes and payload. This is intentionally
-unsuitable for production or untrusted users and may contain secrets.
+## Host and Kubernetes infrastructure
 
-Full mode also adds the exact per-step model `messages` request and response,
-plus tool arguments and results, as correlated OpenTelemetry span events in
-addition to the Redis ledger events.
+`otel-node-collector` runs as a DaemonSet and uses OpenTelemetry hostmetrics every 10 seconds:
 
-## Traces and metrics
+- CPU, load, memory, network, disk, filesystem, process, and process-count metrics.
+- Resource attributes identify the node and `kubernetes-node-telemetry` service.
+- These host measurements do not provide per-request GPU utilization, syscall events, or causal attribution to one program.
 
-OpenTelemetry traces contain correlated spans for task submission, complete
-program execution, agent invocation, model inference, and tool execution.
-Trace context is propagated from the gateway through the worker to vLLM.
-Exceptions are attached to the span where they occur. Phoenix receives these
-traces.
+## Kernel syscall telemetry (eBPF/BCC)
 
-The runtime exports these custom metrics to Prometheus through the collector:
+### What runs where
 
-- `agent.tasks.total`;
-- `agent.task.errors.total`;
-- `agent.inference.requests.total`;
-- `agent.telemetry.events.total`;
-- `agent.handoffs.total`;
-- `agent.program.duration`;
-- `agent.program.queue.duration`; and
-- `agent.program.inference.steps`;
-- `agent.inference.step.duration`;
-- `agent.tool.duration`;
-- `agent.tool.wait`; and
-- `agent.tool.calls.total`.
+- **Execution:** eBPF programs run in the host Linux kernel.
+- **Loader:** BCC compiles and loads them through its Python `BPF` class (`from bcc import BPF`). This uses eBPF.
+- `kernel/Dockerfile` builds `agentic-kernel:0.1`, which packages the user-space Python collector, BCC runtime, health check, and Redis client. The image is a build artifact; Kubernetes does not build it. It must be available on every selected node.
+- `manifests/kernel-telemetry.yaml` defines a privileged DaemonSet for nodes labelled `agentic.io/role=agent` or `agentic.io/role=inference`. It uses host PID visibility and mounts cgroup v2, kernel modules/sources, debugfs, and tracefs.
+- Collector implementation: [`kernel/collector.py`](kernel/collector.py); worker socket client: [`code/kernel_telemetry.py`](code/kernel_telemetry.py); deployment and smoke-check details: [`kernel/README.md`](kernel/README.md).
 
-The collector also scrapes vLLM's native Prometheus endpoint every 15 seconds.
+### What is captured and attributed
 
-The collectors use bounded file-backed sending queues on a
-two-gigabyte persistent volume and exporter retry (up to five minutes) for
-Phoenix and Prometheus remote write. This
-protects against short observability outages; the Redis execution ledger
-remains the durable source of task and step records. Application logs are
-exported as OTLP logs to the persistent Loki deployment (`loki-svc:3100`),
-which uses its own local-path volume.
-Loki is a ClusterIP service; access its API locally with
-`kubectl -n agentic-ai port-forward service/loki-svc 3100:3100`.
+- BCC attaches eBPF probes to `raw_syscalls:sys_enter` and `raw_syscalls:sys_exit`. An active-cgroup map filters observed processes. There is no syscall allowlist or intentional sampling.
+- **Entry:** syscall ID and six raw numeric argument slots.
+- **Exit:** return value and elapsed time, paired with entry using PID/TID.
+- **Missing entry:** exit is marked `unmatched_exit`.
+- **Process exit:** removes stale in-flight state.
+- Record fields include collector ID, node, architecture, type, timestamps, `entry_monotonic_ns`, syscall/cgroup/scope IDs, PID/TID/UID, command, arguments, return value/duration, and available run/program/step/tool or pod identity.
+- Raw argument slots are not dereferenced; pointer values are not filenames, buffers, or decoded structures. Syscall IDs require the node architecture/ABI to interpret.
+- Worker registers and changes scope through `/run/agentic-kernel/collector.sock`. The collector uses Unix-socket `SO_PEERCRED` to identify the host PID and resolves its cgroup v2 inode itself; the client cannot choose another cgroup.
+- The collector ties ownership to PID and process start time, rejects competing program registrations in one cgroup, checks each scope update against the socket peer, and removes stale ownership after process exit/PID reuse.
+- **Program scope:** run/task/program/root/session/agent IDs.
+- **Nested scopes:** step and tool identifiers.
+- **Descendants:** child processes and threads are captured while they remain in the selected cgroup.
+- **Attribution limit:** scope identifies the active container phase; background activity may share that scope.
+- **Inference discovery:** every five seconds, list local pods labelled `telemetry.agentic.io/syscalls=enabled` and match visible `/proc/*/cgroup` entries.
+- **Inference identity:** pod/container fields and `scope_kind=inference`.
+- **Inference limits:** shared vLLM syscalls have no exclusive request/run ID; discovery may miss short-lived cgroups.
 
-## LangGraph topology and delegation correlation
+### Buffering, storage, and health
 
-Phoenix mapping: graph and node spans use the OpenInference `CHAIN` kind,
-agent invocation spans use `AGENT`, model requests use `LLM`, and tool calls
-use `TOOL`. LLM spans also carry bounded numeric
-`llm.token_count.prompt`, `llm.token_count.completion`, and
-`llm.token_count.total` attributes (plus the equivalent `gen_ai.usage.*`
-attributes), allowing Phoenix's native LLM views to render token counts.
-Full model request/response content remains in span events. Tool OpenInference
-input/output fields follow the capture policy and are scalar-normalized for
-OTel; in full research mode they intentionally retain raw tool arguments and
-results, while protected modes retain redacted or hash/length values.
+- Perf callbacks enqueue records without doing Redis or disk I/O. The userspace queue holds 16,384 records by default; the in-flight BPF map holds 65,536 syscalls. Other buffers/maps are finite too.
+- Background writer appends per-node JSONL under `/var/log/agentic-kernel`; default archive rotation is 64 MiB across five rotated files plus active file.
+- Run-attributed records go to Redis: newest 10,000 per run, 30-day TTL by default. Shared inference records remain in node archives.
+- Authenticated `GET /telemetry/runs/{run_id}/kernel?offset=0&limit=200` returns records, counts, truncation, run capture status, and node health; maximum page size is 500.
+- Node heartbeat publishes every five seconds and expires after 20 seconds. Cumulative node counters include perf losses, map overflow, queue drops, discovery errors, identity misses, and export errors. These counters are node-level, not exact per-run loss totals.
+- Redis outage, disk failure, process termination, perf/map/queue overflow, or collector restart can lose records. Archives are bounded and do not automatically replay into Redis; asynchronous exports are snapshots, not a completion barrier.
 
-Every queued task owns one `langgraph.state_graph` execution. The runtime emits
-`langgraph.graph.started`, `langgraph.graph.ended`, and
-`langgraph.graph.error` events and a `langgraph.graph` span with `graph.id`,
-`graph.type`, `task.id`, `run.id`, `agent.id`, `agent.run.id`, and
-`root.run.id`. Model and tools transitions are separate nested
-`langgraph.node.model` and `langgraph.node.tools` spans with started, terminal,
-and error ledger events; terminal events are emitted with an explicit status so
-errors are not mislabeled as successful completion. The existing inference and individual tool spans nest
-under those nodes.
+### Controls and validation limits
 
-Delegation is dynamic, not a fixed static subgraph. A delegated task is a child
-LangGraph graph with `parent.task.id`, `parent.run.id`, `parent_agent_run_id`,
-`root.run.id`, and a durable `handoff.id`. W3C trace context is stored with the
-Redis task and extracted by the child worker, so the root trace remains
-correlated across the queue boundary. Parent delegation, queue, check/poll,
-and completion events include the handoff and child task/run identifiers.
-The complete identity chain is `root.run.id -> parent.task.id` and
-`parent.run.id` -> `handoff.id` -> child `task.id` and `run.id`; compare queue
-wait and execution durations on each side of the handoff to localize delay.
+- `KERNEL_CAPTURE_ENABLED=false`: idle collector; does not load BCC probes and rejects capture registration. Requires rollout.
+- `KERNEL_INFERENCE_SYSCALLS_ENABLED=false`: disables inference discovery while worker scopes may remain enabled.
+- `KERNEL_TELEMETRY_ENABLED`: worker-side registration control. Supplied agent manifest enables it as required; failed registration/scope acknowledgement fails the task.
+- Kernel deployment needs cgroup v2, tracepoint/BCC support, compatible kernel headers, service-account pod-list permissions, host mounts, and privileged execution on both nodes.
+- Readiness checks cover configured idle state or basic attachment/socket and discovery status. They do not prove complete coverage, lossless export, compatibility for every workload, or actual hardware-level performance.
+- GPU execution itself is outside syscall telemetry. Host metrics and vLLM metrics do not substitute for syscall tracing.
 
-Telemetry completeness limits are explicit: missing engine fields mean the
-measurement was unavailable, late, failed before collection, or outside the
-join window; they never mean zero. A worker crash can lose partial timings,
-and the deadline reaper marks those fields unknown and writes
-`timing_complete=false`. Every event persisted by `TelemetryLedger.emit` is exported as a standalone
-child span named for its event type. This includes model/tool steps, phase
-transitions, handoffs, graph observations, queued tasks, externally ingested
-events, and reaper timeouts. Each span carries the event ID, timestamp,
-severity, schema version, all supplied identity fields, and JSON-encoded
-structured attributes and payload. Error and fatal events carry OpenTelemetry
-error status. Export failures are logged and do not interrupt execution.
+## Capture policies, retention, and failure behavior
 
-Terminal task events also carry the final procedural graph and saved program
-summary, covering successful, failed, and reaped runs. The `langgraph.graph`
-span carries the final `procedural_graph` JSON snapshot and
-`procedural_graph.status`; `agent.program` carries its final summary JSON and
-`agent.program.status`. Graph node IDs, action labels, signatures, procedure
-run matches, subgraphs, and delegation edges remain readable in the snapshot.
-Phoenix shows these values in span details; it does not render the JSON as a
-separate native node-and-edge canvas. The trace tree shows event spans beneath
-the active execution span while the snapshot preserves procedural topology.
-In `redacted` mode, topology string values pass through secret masking. In
-`off` mode, string values such as node names, action labels, and signatures are
-replaced with hash/length metadata; JSON keys and numeric structure remain
-available, while identifier values are intentionally obscured.
+### Capture switches
 
-The existing manifests route OTLP traces, metrics, and logs through the
-collector, whose trace pipeline forwards to Phoenix. This documents the
-application export path; it does not verify a running collector or Phoenix
-deployment.
+- Console preview renders `AGENT_PROGRAM_TELEMETRY_ENABLED` and `AGENT_SEMANTIC_TELEMETRY_ENABLED`. Program capture controls saved summaries/steps/program events; semantic capture controls LangGraph, phase, handoff, and procedural-graph observations.
+- Disabling both still keeps minimal lifecycle/ownership bookkeeping needed to run and own tasks. Kernel capture is independent.
+- `CONSOLE_K8S_DISCOVERY` controls read-only node/pod discovery. Console previews do not apply manifests; an operator must review, apply, and roll out changes.
 
+### Content policy
 
-# Durable procedural graphs and KV limits
+- `AGENT_TELEMETRY_CONTENT_CAPTURE=off`: content becomes SHA-256/length metadata.
+- `redacted`: default in application code; strings are secret-masked and bounded (normally 4 KiB, event lists to 100 items).
+- `full`: supplied research manifests set this mode. Raw prompts, model responses, tool arguments/results, event payloads, and string attributes may be retained; lists are not capped at 100. Treat Redis and observability backends as sensitive research storage.
+- OTLP model spans include exact per-step messages and tool spans include arguments/results under full mode. These can contain credentials, private code, or user data.
+- Reports deliberately exclude prompts, responses, tool arguments/results, and workspace content. Kernel numeric syscall arguments and process/workload identifiers remain in exports.
 
-Run and program responses include `procedural_graph`, a durable materialization
-of observed model, tool, delegation, and terminal nodes/edges. A normalized
-action-path signature indexes repeated procedures across runs. The graph is
-constructed during execution and is independent of the bounded event tail. Small
-canonical action windows are persisted as reusable subgraph definitions and
-occurrences, scoped to the owning user. Delegation handoffs add causal parent to
-child edges. It does not inspect hidden reasoning or claim task quality.
-The `subgraphs` object in `procedural_graph` contains canonical IDs, action
-patterns, version, and owner-scoped occurrence run IDs.
+### Task failure and persistence
 
-The vLLM 0.8.5 V0 adapter reports KV lifecycle fields only when request-scoped
-allocation/free/swap ownership is exposed by the engine. Otherwise fields remain
-null and `kv_measurement_reason` explains the unavailable attribution. Prefix
-hash comparisons are not used as eviction or recomputation claims. Tool latency
-is retained only as observed timing; it does not predict or control KV retention.
-
-## Kernel syscall layer
-
-The dedicated eBPF collector records syscall entry and exit separately from the
-semantic execution ledger. See [kernel collection](kernel/README.md) for event
-fields, cgroup scope, configuration, retention/loss behavior, and cluster smoke
-checks. [The overall plan](TELEMETRY_PLAN.md) records the three-layer design and
-the deferred GUI. Kernel observations require privileged node deployment;
-ordinary host/process metrics do not substitute for syscall tracing.
+- Task deadline includes queue time. Command timeout kills the shell process group. Step-budget overflow or a truncated model response fails the program; a tool failure may be recovered by a later step.
+- Queue claims move atomically into `task_processing`. Deadline reaper marks abandoned/overdue tasks Timeout after a 30-second grace period and does not rerun tools.
+- Worker loss can make partial timings unknown; summary reports `timing_complete=false`. Reaper time is the observed terminal time, not a reconstructed crash time.
+- Redis uses AOF with `appendfsync everysec` and a persistent volume; abrupt failure can lose up to about one second of recent writes. Phoenix and Prometheus also use persistent volumes. Local-path storage survives pod replacement, not loss of its node disk.
+- Ledger retention defaults: 30 days and 10,000 events per run. Program summaries/steps are stored separately from the bounded event tail.
+- Missing or late measurements mean unavailable, not zero. Application export is best-effort; Collector queues/retries do not guarantee delivery.
 
 ## Console and report snapshots
 
-The gateway's `/dashboard/` console provides configuration previews, device and
-collector observations, run inspection, and bounded report exports. Its
-authenticated `/console` API retains the existing run ownership boundary.
-See [GUI.md](GUI.md) for startup, capture controls, offline/demo behavior,
-report limits, and read-only Kubernetes discovery. Configuration drafts and
-observed deployment state are distinct; previewing settings does not apply them.
+The gateway serves `/dashboard/` and the authenticated `/console` API:
+
+- Overview/Collection: collection drafts, signal controls, previewed deployment files, and capture settings.
+- Devices: observed Kubernetes nodes, pods, and collector heartbeats when read-only discovery is enabled.
+- Runs: owned run summaries, steps/tools, semantic events, and PID/TID-correlated syscall records.
+- Reports: bounded JSON, Markdown, or CSV snapshots for selected owned runs. Unavailable measurements remain unknown; capture/retention gaps are included.
+- Reports exclude prompts, model responses, tool arguments/results, and workspace content. Treat syscall argument slots and workload identifiers as research data. Kernel export is asynchronous, so report contents are a snapshot.
+- Offline/demo mode is labelled sample data; it does not indicate a connected cluster. Previewing collection settings does not change deployed resources.
+
+See [`GUI.md`](GUI.md) for startup, API routes, report bounds, and read-only discovery details.
+
+## Explicitly unsupported or unverified
+
+- Agent `Success` and a generated benchmark patch do not mean benchmark tests passed. SWE-bench runner is for telemetry/patch generation, not leaderboard-equivalent grading.
+- vLLM 0.8.5 V0 does not provide request-scoped KV allocation/free/swap ownership; KV lifecycle fields remain null with an unavailable reason.
+- vLLM batch-forward GPU time is not exclusive per-request GPU occupancy. Shared inference syscalls have no exclusive request/run attribution.
+- Kernel syscall coverage, BPF verifier acceptance, losslessness, and performance have not been established merely by local tests or manifest validation; validate on the actual nodes and workload.
+- Configured OTLP paths and manifests do not prove that Collector, Phoenix, Prometheus, Loki, or kernel collectors are currently healthy. Check rollout, collector logs, heartbeats, and backend data in the target cluster.
+- Telemetry does not inspect hidden model reasoning, decode syscall pointer targets, or observe GPU device execution.

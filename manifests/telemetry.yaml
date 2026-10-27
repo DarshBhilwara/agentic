@@ -39,7 +39,8 @@ data:
         retry_on_failure: {enabled: true, max_elapsed_time: 300s}
       prometheusremotewrite:
         endpoint: http://prometheus-svc:9090/api/v1/write
-        sending_queue: {enabled: true, queue_size: 1000, storage: file_storage/queue}
+        remote_write_queue: {enabled: true, queue_size: 1000, num_consumers: 1}
+        wal: {directory: /var/lib/otelcol/queue/prometheus-wal}
         retry_on_failure: {enabled: true, max_elapsed_time: 300s}
       loki:
         endpoint: http://loki-svc:3100/loki/api/v1/push
