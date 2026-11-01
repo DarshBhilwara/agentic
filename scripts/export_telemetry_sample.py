@@ -173,12 +173,13 @@ def _owned_terminal_run(api, run_id):
     summary = data.get("summary") or {}
     safe_steps = []
     for step in data.get("steps", []):
-        safe_steps.append({key: step.get(key) for key in
-                           ("program_id", "step_index", "request_id", "step_status") if key in step} |
-                          {"tools": [{key: tool.get(source) for key, source in
-                                      (("name", "tool_name"), ("call_id", "tool_call_id"),
-                                       ("index", "tool_index"), ("status", "tool_status"))
-                                      if source in tool} for tool in step.get("tools", [])]})
+        safe_step = {key: step.get(key) for key in
+                     ("program_id", "step_index", "request_id", "step_status") if key in step}
+        safe_step["tools"] = [{key: tool.get(source) for key, source in
+                               (("name", "tool_name"), ("call_id", "tool_call_id"),
+                                ("index", "tool_index"), ("status", "tool_status"))
+                               if source in tool} for tool in step.get("tools", [])]
+        safe_steps.append(safe_step)
     safe_event_fields = ("id", "type", "timestamp", "run.id", "program_id", "step_index", "tool_call_id",
                          "tool_name", "trace.id", "span.id", "task.id", "agent.id", "agent.run.id",
                          "agent.parent.run.id", "root.run.id", "handoff.id")
