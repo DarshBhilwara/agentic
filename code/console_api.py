@@ -140,12 +140,6 @@ def render_files(config):
         node_pipeline["receivers"] = [r for r in node_pipeline.get("receivers", []) if r != "hostmetrics"]
     gateway_config["data"]["config.yaml"] = yaml.safe_dump(gateway_yaml, sort_keys=False)
     node_config["data"]["config.yaml"] = yaml.safe_dump(node_yaml, sort_keys=False)
-    if not config["kernel_enabled"]:
-        # Leave the privileged collector available but explicitly disabled; rollout is required.
-        for doc in kernel:
-            if doc and doc.get("kind") == "DaemonSet":
-                c = doc["spec"]["template"]["spec"]["containers"][0]
-                c.setdefault("env", []).append({"name": "KERNEL_CAPTURE_ENABLED", "value": "false"})
     for doc in kernel:
         if doc and doc.get("kind") == "DaemonSet":
             c = doc["spec"]["template"]["spec"]["containers"][0]
@@ -243,12 +237,117 @@ def _safe_events(events):
     return output
 
 
+def _evenly_spaced_indexes(length, count):
+    if count >= length:
+        return list(range(length))
+    if count <= 1:
+        return [length - 1] if length else []
+    return [round(index * (length - 1) / (count - 1)) for index in range(count)]
+
+
+def _monotonic_order(record, index):
+    try:
+        return (0, int(record.get("monotonic_ns")), index)
+    except (TypeError, ValueError):
+        return (1, 0, index)
+
+
+def _chronological_kernel_records(records):
+    return [record for _, record in sorted(enumerate(records), key=lambda item: _monotonic_order(item[1], item[0]))]
+
+
+def _sample_kernel_records(records, limit=500):
+    """Keep a chronological, bounded sample with representatives from each scope."""
+    if len(records) <= limit:
+        return _chronological_kernel_records(records)
+
+    scope_indexes = {}
+    entries = {}
+    exits = {}
+    for index, record in enumerate(records):
+        step = record.get("step_index")
+        tool = record.get("tool_call_id") or record.get("tool_name")
+        if tool:
+            scope = ("tool", step, tool)
+            scope_indexes.setdefault(scope, []).append(index)
+        elif step is not None:
+            scope = ("step", step)
+            scope_indexes.setdefault(scope, []).append(index)
+
+        if record.get("type") in {"entry", "exit"} and record.get("entry_monotonic_ns") is not None:
+            pair_key = (record.get("collector_id"), record.get("pid"), record.get("tid"),
+                        record.get("entry_monotonic_ns"), record.get("syscall_id"))
+            target = entries if record["type"] == "entry" else exits
+            target.setdefault(pair_key, index)
+
+    pairs = [(entry_index, exits[pair_key])
+             for pair_key, entry_index in entries.items() if pair_key in exits]
+    exit_by_entry = {entry_index: exit_index for entry_index, exit_index in pairs}
+
+    representatives = []
+    for indexes in scope_indexes.values():
+        first_entry = next((i for i in indexes if records[i].get("type") == "entry"), None)
+        if first_entry is None:
+            representatives.append((indexes[0],))
+            continue
+        exit_index = exit_by_entry.get(first_entry)
+        representatives.append((first_entry, exit_index) if exit_index is not None else (first_entry,))
+
+    unmatched_index = next((i for i, record in enumerate(records)
+                            if record.get("type") == "unmatched_exit"), None)
+    selected = {unmatched_index} if unmatched_index is not None else set()
+    if len(representatives) <= limit // 2:
+        for representative in representatives:
+            available = limit - len(selected)
+            if len(representative) <= available:
+                selected.update(representative)
+            elif available:
+                selected.add(representative[0])
+    elif len(representatives) <= limit:
+        scope_count = min(len(representatives), limit - len(selected))
+        selected.update(representatives[i][0]
+                         for i in _evenly_spaced_indexes(len(representatives), scope_count))
+    else:
+        scope_count = min(len(representatives), limit - len(selected))
+        selected.update(representatives[i][0]
+                         for i in _evenly_spaced_indexes(len(representatives), scope_count))
+
+    remaining = limit - len(selected)
+    if remaining:
+        partial_pairs = [(entry, exit_) for entry, exit_ in pairs
+                         if (entry in selected) != (exit_ in selected)]
+        partial_count = min(len(partial_pairs), remaining)
+        if partial_count:
+            for pair_index in _evenly_spaced_indexes(len(partial_pairs), partial_count):
+                selected.update(partial_pairs[pair_index])
+
+    remaining = limit - len(selected)
+    if remaining:
+        candidate_pairs = [(entry, exit_) for entry, exit_ in pairs
+                           if entry not in selected and exit_ not in selected]
+        pair_count = min(len(candidate_pairs), remaining // 2)
+        if pair_count:
+            selected_pairs = _evenly_spaced_indexes(len(candidate_pairs), pair_count)
+            for pair_index in selected_pairs:
+                selected.update(candidate_pairs[pair_index])
+
+    remaining = limit - len(selected)
+    if remaining:
+        candidates = [index for index in range(len(records)) if index not in selected]
+        selected.update(candidates[i] for i in _evenly_spaced_indexes(len(candidates), remaining))
+
+    sampled = [records[index] for index in sorted(selected)]
+    return _chronological_kernel_records(sampled)
+
+
 def _kernel_snapshot(redis_client, run_id):
     key = f"kernel:run:{run_id}"
-    records = [json.loads(v) for v in redis_client.lrange(key, 0, 499)]
+    raw_records = redis_client.lrange(key, 0, -1)
+    retained = len(raw_records)
+    records = _sample_kernel_records([json.loads(v) for v in raw_records])
     raw = redis_client.hgetall(f"{key}:status")
     status = {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else str(v)) for k, v in raw.items()}
-    total, retained = int(status.get("events", 0) or 0), redis_client.llen(key)
+    total = int(status.get("events", 0) or 0)
     node, node_health = status.get("node"), {}
     if node:
         raw_health = redis_client.hgetall(f"kernel:node:{node}:status")
@@ -257,7 +356,8 @@ def _kernel_snapshot(redis_client, run_id):
         age = max(0, time.time() - heartbeat) if heartbeat else None
         node_health["heartbeat_age_seconds"] = age
         node_health["heartbeat_ok"] = age is not None and age <= 20
-    return {"records": records, "total": total, "retained": retained, "truncated": total > len(records) or retained > len(records),
+    return {"records": records, "total": total, "retained": retained, "sampled": retained > len(records),
+            "truncated": total > len(records) or retained > len(records),
             "status": status, "node_health": node_health}
 
 

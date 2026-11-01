@@ -22,10 +22,17 @@ def test_engine_timing_units_and_single_token_decode():
     assert agentic_vllm.request_identity(group.request_id) == ("program", 2)
 
 
-def test_kv_matching_does_not_count_new_or_changed_context():
-    assert agentic_vllm.matching_prefix_tokens([1, 2, 3], [1, 2, 4, 5], 16) == 32
-    assert agentic_vllm.matching_prefix_tokens([1, 2], [8, 2], 16) == 0
-    assert agentic_vllm.matching_prefix_tokens([], [1], 16) == 0
+def test_kv_lifecycle_is_unknown_without_request_scoped_ownership():
+    group = NS(request_id="chatcmpl-program.1.nonce",
+               metrics=NS(first_scheduled_time=10, first_token_time=10.1,
+                          finished_time=10.2, time_in_queue=0, model_forward_time=5))
+    metrics = agentic_vllm.request_metrics(group)
+    for field in ("kv_recomputed_tokens", "kv_retained_tokens", "kv_evicted_tokens",
+                  "kv_restored_tokens", "kv_memory_tier", "kv_residency",
+                  "kv_eviction_cause", "cache_affinity_hit"):
+        assert metrics[field] is None
+    assert metrics["kv_measurement"] == "unavailable"
+    assert metrics["kv_measurement_reason"]
 
 
 def test_benchmark_prompt_allowlist():

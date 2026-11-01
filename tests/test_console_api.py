@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from console_api import DEFAULTS, attach_console, render_files
+from console_api import DEFAULTS, _kernel_snapshot, _sample_kernel_records, attach_console, render_files
 from collection_policy import program_capture_enabled
 from kernel.collector import disabled_response
 
@@ -40,6 +40,13 @@ def test_config_preview_maps_toggles_into_manifests():
     assert "AGENT_PROGRAM_TELEMETRY_ENABLED" in files["agent-node.yaml"]
     assert "replicas: 3" in files["agent-node.yaml"]
     assert "KERNEL_CAPTURE_ENABLED" in files["kernel-telemetry.yaml"]
+    collector = next(d for d in yaml.safe_load_all(files["kernel-telemetry.yaml"])
+                     if d and d.get("kind") == "DaemonSet")
+    collector_env = collector["spec"]["template"]["spec"]["containers"][0]["env"]
+    names = [entry["name"] for entry in collector_env]
+    assert len(names) == len(set(names))
+    assert next(entry["value"] for entry in collector_env
+                if entry["name"] == "KERNEL_CAPTURE_ENABLED") == "false"
     telemetry = files["telemetry.yaml"]
     assert "pipelines: {}" in telemetry or "traces:" not in telemetry
     assert "console-access.yaml" in files
@@ -130,13 +137,92 @@ def test_reports_filter_content_for_all_formats_and_escape_csv_formulas():
     ledger.run = lambda run_id: {"id": run_id, "user.id": "alice", "status": "completed", "summary": {"inference_steps": 1, "prompt": "private-secret"}, "workspace.id": "/secret/path"}
     ledger.steps = lambda _run: [{"step_index": 1, "step_status": "Success", "step_time_ms": 4, "prompt": "private-secret", "tools": [{"tool_name": "=FORMULA()", "tool_status": "Success", "tool_latency_ms": 2, "arguments": "private-secret"}]}]
     ledger.events = lambda *_a, **_k: [{"id": "e", "type": "tool.completed", "payload": {"result": "private-secret"}, "attributes": {"tool_name": "read_file", "result": "private-secret", "prompt": "private-secret"}}]
-    app = FastAPI(); attach_console(app, lambda: "alice", FakeRedis, lambda: ledger)
-    client = TestClient(app)
+    # Exercise serialization directly; authentication/ownership has separate API coverage.
+    class ReportApp:
+        def include_router(self, router):
+            self.routes = router.routes
+    app = ReportApp(); attach_console(app, lambda: "alice", FakeRedis, lambda: ledger)
+    report = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/console/reports")
     for fmt in ("json", "markdown", "csv"):
-        response = client.post("/console/reports", json={"run_ids": ["run-1"], "format": fmt})
+        response = report({"run_ids": ["run-1"], "format": fmt}, user="alice")
         assert response.status_code == 200
-        assert "private-secret" not in response.text and "/secret/path" not in response.text
-        if fmt == "csv": assert "'=FORMULA()" in response.text
+        text = response.body.decode()
+        assert "private-secret" not in text and "/secret/path" not in text
+        if fmt == "csv": assert "'=FORMULA()" in text
+
+
+def test_kernel_report_sample_includes_late_tool_scope():
+    rows = []
+    for pair in range(500):
+        timestamp = pair * 2
+        common = {"collector_id": "c1", "pid": 10, "tid": 10, "syscall_id": pair}
+        rows.extend([
+            {**common, "type": "entry", "monotonic_ns": timestamp, "entry_monotonic_ns": timestamp},
+            {**common, "type": "exit", "monotonic_ns": timestamp + 1, "entry_monotonic_ns": timestamp},
+        ])
+    rows.extend([
+        {"type": "entry", "monotonic_ns": 1000, "entry_monotonic_ns": 1000,
+         "collector_id": "c1", "pid": 10, "tid": 10, "syscall_id": 2,
+         "step_index": 1, "tool_name": "execute_command", "tool_call_id": "call-1"},
+        {"type": "exit", "monotonic_ns": 1001, "entry_monotonic_ns": 1000,
+         "collector_id": "c1", "pid": 10, "tid": 10, "syscall_id": 2,
+         "step_index": 1, "tool_name": "execute_command", "tool_call_id": "call-1"},
+    ])
+
+    class SnapshotRedis:
+        lrange_calls = 0
+        def lrange(self, _key, start, stop):
+            self.lrange_calls += 1
+            assert start == 0 and stop == -1
+            return [json.dumps(row).encode() for row in rows]
+        def hgetall(self, _key): return {b"events": b"1002"}
+
+    redis_client = SnapshotRedis()
+    rows[0], rows[2] = rows[2], rows[0]
+    snapshot = _kernel_snapshot(redis_client, "run-1")
+    sampled = snapshot["records"]
+    tool_records = [row for row in sampled if row.get("tool_call_id") == "call-1"]
+    assert len(sampled) == 500
+    assert snapshot["sampled"] is True and snapshot["truncated"] is True
+    assert [(row["type"], row["step_index"], row["tool_name"]) for row in tool_records] == [
+        ("entry", 1, "execute_command"), ("exit", 1, "execute_command")]
+    assert [row["monotonic_ns"] for row in sampled] == sorted(row["monotonic_ns"] for row in sampled)
+    paired = {}
+    for row in sampled:
+        key = (row["collector_id"], row["pid"], row["tid"], row["entry_monotonic_ns"], row["syscall_id"])
+        paired.setdefault(key, set()).add(row["type"])
+    assert all(types == {"entry", "exit"} for types in paired.values())
+    assert len(paired) == len(sampled) // 2
+    assert redis_client.lrange_calls == 1
+
+
+def test_kernel_report_sorts_small_snapshots_stably_by_monotonic_time():
+    rows = [
+        {"id": "late", "monotonic_ns": 20},
+        {"id": "first-tie", "monotonic_ns": 10},
+        {"id": "second-tie", "monotonic_ns": 10},
+    ]
+    assert [row["id"] for row in _sample_kernel_records(rows)] == [
+        "first-tie", "second-tie", "late"]
+
+
+def test_kernel_report_keeps_unmatched_exit_when_pairs_fill_sample():
+    rows = []
+    for pair in range(300):
+        timestamp = pair * 2
+        common = {"collector_id": "c1", "pid": 10, "tid": 10, "syscall_id": pair}
+        rows.extend([
+            {**common, "type": "entry", "monotonic_ns": timestamp, "entry_monotonic_ns": timestamp},
+            {**common, "type": "exit", "monotonic_ns": timestamp + 1, "entry_monotonic_ns": timestamp},
+        ])
+    rows.append({"collector_id": "c1", "pid": 10, "tid": 10, "type": "unmatched_exit",
+                 "monotonic_ns": 600, "entry_monotonic_ns": None, "syscall_id": 999,
+                 "step_index": 3, "tool_name": "execute_command", "tool_call_id": "call-gap"})
+
+    sampled = _sample_kernel_records(rows)
+    assert len(sampled) == 500
+    assert any(row.get("type") == "unmatched_exit" and row.get("tool_call_id") == "call-gap"
+               for row in sampled)
 
 
 def test_worker_finishes_when_program_and_semantic_capture_are_off(monkeypatch, tmp_path):

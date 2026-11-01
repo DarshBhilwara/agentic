@@ -4,7 +4,7 @@ A Kubernetes-based autonomous-agent platform with per-user workspaces, a
 LangGraph worker runtime, and an execution ledger backed by OpenTelemetry and
 Redis. It uses one Kubernetes cluster with separate agent and inference nodes.
 Telemetry combines program measurements, semantic execution events, and an
-eBPF syscall layer. See [the overall plan](TELEMETRY_PLAN.md) for scope and
+eBPF syscall layer. See the [telemetry contract](TELEMETRY.md) for scope and
 the [telemetry console guide](GUI.md) for the configuration and reporting GUI.
 
 The gateway serves the console at `/dashboard/`. It offers collection drafts,
