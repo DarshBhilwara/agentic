@@ -237,7 +237,8 @@ def run(args):
         stage = "submission"
         submitted = _invoke(api, "POST", "/sessions/%s/messages" % session["session_id"],
                             params={"prompt": PROMPT, "max_steps": args.max_steps,
-                                    "timeout_seconds": args.timeout, "coding_only": "true"})
+                                    "timeout_seconds": args.timeout, "coding_only": "true",
+                                    "require_command_execution": "true"})
         manifest.update({"task_id": submitted.get("task_id"), "program_id": submitted.get("program_id"),
                          "run_id": submitted.get("run_id"), "turn_id": submitted.get("turn_id"),
                          "task_status": "queued"})

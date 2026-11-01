@@ -162,6 +162,27 @@ def correlate(records, run_id, program_id):
             "unmatched_exits": unmatched, "warnings": warnings}
 
 
+def _safe_recovery_policy(attributes):
+    """Keep only known runtime policy values, without arbitrary event content."""
+    values = {}
+    allowed = {
+        "tool_choice_mode": {"auto", "required"},
+        "required_tool_name": {"", "write_file", "execute_command"},
+        "recovery_reason": {"", "workspace_unchanged", "command_not_executed", "command_not_successful"},
+    }
+    for key, choices in allowed.items():
+        value = attributes.get(key)
+        if isinstance(value, str) and value in choices:
+            values[key] = value
+    reason = attributes.get("reason")
+    if isinstance(reason, str) and reason in allowed["recovery_reason"] - {""}:
+        values["completion_rejection_reason"] = reason
+        count = attributes.get("rejected_completions")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            values["rejected_completions"] = count
+    return values
+
+
 def _owned_terminal_run(api, run_id):
     data = api.request("GET", f"/telemetry/runs/{quote(run_id, safe='')}",
                        params={"offset": 0, "limit": MAX_SEMANTIC_EVENTS})
@@ -190,6 +211,7 @@ def _owned_terminal_run(api, run_id):
         if isinstance(attributes, dict):
             safe.update({key: attributes[key] for key in safe_event_fields
                          if key in attributes and key not in safe})
+            safe.update(_safe_recovery_policy(attributes))
         safe_events.append(safe)
     return {"run": {key: run.get(key) for key in
                      ("id", "program_id", "task.id", "session.id", "agent.id", "agent.run.id",

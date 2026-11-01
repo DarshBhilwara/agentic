@@ -73,7 +73,9 @@ def test_steps_include_all_tools_and_terminal_response(tmp_path, fake_model):
 def test_procedural_graph_connects_consecutive_steps(tmp_path, fake_model, monkeypatch, with_tools):
     fake_model.side_effect = [completion([tool()] if with_tools else None), completion()]
     if not with_tools:
-        monkeypatch.setattr(agent, "workspace_has_changes", Mock(side_effect=[False, True]))
+        monkeypatch.setattr(agent, "workspace_has_changes", Mock(return_value=True))
+        fake_model.side_effect = [completion([tool("write_file", '{"path":"created.txt","content":"ok"}')]),
+                                  completion()]
     ledger = TelemetryLedger(fakeredis.FakeRedis())
     ledger.start_run("run", **{"user.id": "alice"})
 
@@ -84,10 +86,11 @@ def test_procedural_graph_connects_consecutive_steps(tmp_path, fake_model, monke
     monkeypatch.setattr(agent, "_emit", emit)
     agent.run("fix", "alice", workspace=str(tmp_path), require_workspace_changes=not with_tools)
     graph = ledger.graph("run")
-    predecessor = "tools:1" if with_tools else "model:1"
+    predecessor = "tools:1"
     assert ["START", "model:1"] in graph["edges"]
     assert [predecessor, "model:2"] in graph["edges"]
     assert ["model:2", "END"] in graph["edges"]
+    assert "tools:1" in graph["nodes"]
     assert "tools" not in graph["nodes"]
 
 
@@ -145,12 +148,88 @@ def test_coding_task_without_changes_is_rejected(tmp_path, fake_model):
         "git", "-C", str(tmp_path), "-c", "user.name=Test", "-c",
         "user.email=test@example.com", "commit", "-m", "base",
     ], check=True, capture_output=True)
+    fake_model.side_effect = [completion([tool("write_file", '{"path":"created.txt","content":"ok"}')]),
+                              completion(),
+                              completion([tool("write_file", '{"path":"created2.txt","content":"ok"}')]),
+                              completion()]
+    from unittest.mock import patch
+    with patch.object(agent, "workspace_has_changes", return_value=False):
+        measured = ProgramTelemetry("p")
+        with pytest.raises(RuntimeError, match="without making workspace changes"):
+            agent.run("fix", "alice", workspace=str(tmp_path), measurements=measured,
+                      require_workspace_changes=True)
+    assert len(measured.steps) == 4
+
+
+def test_recovery_requires_real_write_then_successful_command(tmp_path, fake_model, monkeypatch):
+    fake_model.side_effect = [
+        completion(),
+        completion([tool("write_file", '{"path":"sample.txt","content":"ok"}', "write-1")]),
+        completion(),
+        completion([tool("execute_command", '{"command":"cat sample.txt"}', "command-1")]),
+        completion(),
+    ]
+    workspace_changes = iter([False, True, True])
+    monkeypatch.setattr(agent, "workspace_has_changes", lambda _: next(workspace_changes))
+    result, _ = agent.run("write and verify", "alice", workspace=str(tmp_path),
+                          require_workspace_changes=True, require_command_execution=True)
+    assert result == "Done"
+    calls = fake_model.call_args_list
+    assert calls[1].kwargs["tool_choice"] == {"type": "function", "function": {"name": "write_file"}}
+    assert calls[3].kwargs["tool_choice"] == {"type": "function", "function": {"name": "execute_command"}}
+
+
+@pytest.mark.parametrize("write_first", [True, False])
+def test_command_policy_uses_tool_order_within_one_step(tmp_path, fake_model, write_first):
+    write = tool("write_file", '{"path":"ordered.txt","content":"ok"}', "write-order")
+    command = tool("execute_command", '{"command":"cat ordered.txt"}', "command-order")
+    calls = [write, command] if write_first else [command, write]
+    fake_model.side_effect = [completion(calls), completion()]
+    if not write_first:
+        fake_model.side_effect = [completion(calls), completion(),
+                                  completion([tool("execute_command", '{"command":"cat ordered.txt"}', "command-retry")]),
+                                  completion()]
+    result, _ = agent.run("edit and verify", "alice", workspace=str(tmp_path),
+                          require_command_execution=True)
+    assert result == "Done"
+    if not write_first:
+        assert fake_model.call_args_list[2].kwargs["tool_choice"] == {
+            "type": "function", "function": {"name": "execute_command"}}
+
+
+def test_failed_write_attempt_invalidates_prior_command_verification(tmp_path, fake_model):
+    fake_model.side_effect = [
+        completion([
+            tool("write_file", '{"path":"partial.txt","content":"complete"}', "write-ok"),
+            tool("execute_command", '{"command":"cat partial.txt"}', "command-ok"),
+            tool("write_file", '{"path":"partial.txt","content":null}', "write-failed"),
+        ]),
+        completion(),
+        completion([tool("execute_command", '{"command":"cat partial.txt"}', "command-retry")]),
+        completion(),
+    ]
+    result, _ = agent.run("edit and verify", "alice", workspace=str(tmp_path),
+                          require_command_execution=True)
+    assert result == "Done"
+    assert fake_model.call_args_list[2].kwargs["tool_choice"] == {
+        "type": "function", "function": {"name": "execute_command"}}
+
+
+def test_forced_tool_request_rejects_narrative_response(tmp_path, fake_model):
     fake_model.side_effect = [completion(), completion()]
-    measured = ProgramTelemetry("p")
-    with pytest.raises(RuntimeError, match="without making workspace changes"):
-        agent.run("fix", "alice", workspace=str(tmp_path), measurements=measured,
-                  require_workspace_changes=True)
-    assert len(measured.steps) == 2
+    from unittest.mock import patch
+    with patch.object(agent, "workspace_has_changes", return_value=False):
+        with pytest.raises(RuntimeError, match="required structured tool call: write_file"):
+            agent.run("edit", "alice", workspace=str(tmp_path), require_workspace_changes=True)
+
+
+def test_recovery_fails_clearly_when_required_tool_is_disabled(tmp_path, fake_model):
+    fake_model.return_value = completion()
+    from unittest.mock import patch
+    with patch.object(agent, "workspace_has_changes", return_value=False):
+        with pytest.raises(RuntimeError, match="Required recovery tool is unavailable: write_file"):
+            agent.run("edit", "alice", workspace=str(tmp_path), require_workspace_changes=True,
+                      enabled_tools=["read_file"])
 
 
 def test_request_join_does_not_mix_concurrent_programs():

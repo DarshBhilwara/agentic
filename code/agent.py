@@ -51,9 +51,12 @@ The current user workspace is: {workspace}
 Operational rules:
 1. Use a tool as much as possible whenever you need information or an effect you do not already have or something that can be better done by tools.
 2. Never fabricate tool output.
-3. Prefer read-only tools when they can accomplish the task.
-4. Keep changes inside the current user workspace unless the task explicitly requires another path.
-5. When the task is complete, give a concise plain-language summary.
+3. Tools run only when you return an actual structured tool call. Printing code,
+   command text, or <tool_call> markup does not run it. Never claim results you
+   did not observe from a tool response.
+4. Prefer read-only tools when they can accomplish the task.
+5. Keep changes inside the current user workspace unless the task explicitly requires another path.
+6. When the task is complete, give a concise plain-language summary.
 """
 
 TOOLS = [
@@ -583,17 +586,24 @@ class AgentGraphState(TypedDict):
     route: Literal["model", "tools", "end"]
     previous_node: str
     result: str
+    forced_tool_name: str
+    recovery_reason: str
+    tool_ordinal: int
+    last_write_attempt_order: int
+    last_command_order: int
+    last_command_status: str
 
 
 def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
-                       max_steps, require_workspace_changes, turn_span):
+                       max_steps, require_workspace_changes, require_command_execution, turn_span):
     """Build the model -> tools -> model LangGraph workflow for one agent run.
 
     Runtime dependencies stay in this closure rather than graph state, keeping
     the state explicit and serializable for a future durable checkpointer.
     """
     active_step = {"manager": None, "record": None}
-    rejected_completions = {"count": 0}
+    rejected_completions = {"workspace_unchanged": 0, "command_not_executed": 0,
+                            "command_not_successful": 0}
 
     def close_step(exc_info=(None, None, None)):
         manager = active_step["manager"]
@@ -625,6 +635,11 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
               "procedure.id": record.procedure_id, "subgraph.id": record.subgraph_id})
         attrs = {"program_id": measurements.program_id, "step_index": step_index,
                  "agent.step.number": step_index, "request_id": record.request_id}
+        forced_tool_name = state.get("forced_tool_name", "")
+        recovery_reason = state.get("recovery_reason", "")
+        attrs.update({"tool_choice_mode": "required" if forced_tool_name else "auto",
+                      "required_tool_name": forced_tool_name,
+                      "recovery_reason": recovery_reason})
         node_span = span("langgraph.node.model", **{"openinference.span.kind": "CHAIN", **attrs})
         node_span.__enter__()
         _emit("langgraph.node.started", attributes={**attrs, "graph.node": "model"})
@@ -646,7 +661,9 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
                 try:
                     response = client.chat.completions.create(
                         model=MODEL_NAME, messages=state["messages"], tools=tools or None,
-                        tool_choice="auto" if tools else None, max_tokens=4096, temperature=0.1,
+                        tool_choice=({"type": "function", "function": {"name": forced_tool_name}}
+                                     if forced_tool_name else ("auto" if tools else None)),
+                        max_tokens=4096, temperature=0.1,
                         extra_headers={**inject_context(), "X-Request-Id": request_id})
                 except APITimeoutError as exc:
                     _emit("model.failed", attributes={**attrs, "error.type": type(exc).__name__}, severity="error")
@@ -675,6 +692,8 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
                 calls = message.tool_calls or []
                 tool_calls = [{"id": call.id, "name": call.function.name,
                                "arguments": call.function.arguments} for call in calls]
+                if forced_tool_name and (not tool_calls or any(c["name"] != forced_tool_name for c in tool_calls)):
+                    raise RuntimeError("Model did not return the required structured tool call: " + forced_tool_name)
                 decision = intent_decision([call["name"] for call in tool_calls])
                 for key, value in decision.items():
                     value = json.dumps(value) if isinstance(value, list) else value
@@ -705,7 +724,16 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
                 return {"messages": messages, "step_index": step_index,
                         "tool_calls": tool_calls, "route": "tools"}
             if require_workspace_changes and not workspace_has_changes(workspace):
-                rejected_completions["count"] += 1
+                reject_reason = "workspace_unchanged"
+            elif require_command_execution and not (
+                    state.get("last_command_status") == "Success" and
+                    state.get("last_command_order", 0) > state.get("last_write_attempt_order", 0)):
+                reject_reason = ("command_not_successful" if state.get("last_command_order", 0) > 0
+                                 else "command_not_executed")
+            else:
+                reject_reason = ""
+            if reject_reason:
+                rejected_completions[reject_reason] += 1
                 record.actual_transition = "model->model"
                 record.expected_transition = "model->end"
                 record.constraint_violation = True
@@ -713,23 +741,29 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
                       "step_index": step_index, "phase": "reasoning", "phase_status": "ended",
                       "constraint_violation": True})
                 _emit("agent.completion.rejected", attributes={
-                    **attrs, "reason": "workspace_unchanged",
-                    "rejected_completions": rejected_completions["count"],
+                    **attrs, "reason": reject_reason,
+                    "rejected_completions": rejected_completions[reject_reason],
                 }, severity="error")
                 close_step()
-                if rejected_completions["count"] >= 2:
-                    raise RuntimeError("Coding task completed without making workspace changes")
+                if rejected_completions[reject_reason] >= 2:
+                    if reject_reason == "workspace_unchanged":
+                        raise RuntimeError("Coding task completed without making workspace changes")
+                    raise RuntimeError("Coding task completed without a successful command after its latest workspace change")
+                required_tool = "write_file" if reject_reason == "workspace_unchanged" else "execute_command"
+                if required_tool not in {t["function"]["name"] for t in tools}:
+                    raise RuntimeError("Required recovery tool is unavailable: " + required_tool)
+                recovery_prompt = ("No workspace changes were detected. Make the required edit now using an actual "
+                                   "structured write_file call. Do not print code or tool-call markup.") if required_tool == "write_file" else (
+                                   "Run an actual verification command using a structured execute_command call after the latest edit. "
+                                   "Do not print command text or tool-call markup, and report only observed results.")
                 messages.append({
                     "role": "user",
-                    "content": (
-                        "No workspace changes were detected, so the coding task is not complete. "
-                        "Continue inspecting the repository and make the required changes. Do not "
-                        "describe changes unless you actually apply them."
-                    ),
+                    "content": recovery_prompt,
                 })
                 return {"messages": messages, "step_index": step_index,
                         "tool_calls": [], "route": "model",
-                        "previous_node": f"model:{step_index}"}
+                        "previous_node": f"model:{step_index}", "forced_tool_name": required_tool,
+                        "recovery_reason": reject_reason}
             result = message.content or ""
             _emit("procedural_graph.observed", attributes={"node": "END",
                   "previous_node": f"model:{step_index}", "action": "terminal.success"})
@@ -792,8 +826,26 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
               "acting_time_ms": record.step_t_acting_ms,
               "idleness_ratio": record.step_t_acting_ms / max(record.step_t_acting_ms + record.llm_inference_time_ms, 1)})
         close_step()
+        tool_ordinal = state.get("tool_ordinal", 0)
+        # Any write attempt can truncate or otherwise partially alter its target
+        # before failing, so it invalidates an earlier successful verification.
+        last_write_attempt_order = state.get("last_write_attempt_order", 0)
+        last_command_order = state.get("last_command_order", 0)
+        last_command_status = state.get("last_command_status", "")
+        for call in state["tool_calls"]:
+            tool_ordinal += 1
+            record_tool = next((item for item in record.tools if item.get("tool_call_id") == call["id"]), {})
+            if call["name"] == "write_file":
+                last_write_attempt_order = tool_ordinal
+            if call["name"] == "execute_command":
+                last_command_order = tool_ordinal
+                last_command_status = record_tool.get("tool_status", "Failed")
         return {"messages": messages, "tool_calls": [], "route": "model",
-                "previous_node": f"tools:{state['step_index']}"}
+                "previous_node": f"tools:{state['step_index']}", "forced_tool_name": "",
+                "recovery_reason": "", "tool_ordinal": tool_ordinal,
+                "last_write_attempt_order": last_write_attempt_order,
+                "last_command_order": last_command_order,
+                "last_command_status": last_command_status}
 
     def route_after_model(state: AgentGraphState):
         return state["route"]
@@ -815,7 +867,8 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
         handoff_id=None,
         agent_name="enterprise-agent",
         event_sink=None, redis_client=None, measurements=None, max_steps=100,
-        timeout_seconds=1800, enabled_tools=None, require_workspace_changes=False):
+        timeout_seconds=1800, enabled_tools=None, require_workspace_changes=False,
+        require_command_execution=False):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", user):
         raise ValueError("invalid user identity")
     workspace = workspace or os.path.join("/workspace/users", user)
@@ -849,6 +902,7 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
                 client=client, workspace=workspace, tools=tools, measurements=measurements,
                 redis_client=redis_client, max_steps=max_steps,
                 require_workspace_changes=require_workspace_changes, turn_span=turn_span,
+                require_command_execution=require_command_execution,
             )
             graph_attrs = {"graph.id": "agent.model-tools", "graph.type": "langgraph.state_graph",
                            "graph.version": "1", "task.id": task_id, "run.id": run_id,
@@ -864,7 +918,9 @@ def run(prompt: str, user: str, *, workspace=None, session_id="standalone", agen
                 try:
                   final_state = graph.invoke(
                 {"messages": messages, "step_index": 0, "tool_calls": [],
-                 "route": "model", "result": ""},
+                 "route": "model", "result": "", "forced_tool_name": "", "recovery_reason": "",
+                 "tool_ordinal": 0, "last_write_attempt_order": 0, "last_command_order": 0,
+                 "last_command_status": ""},
                 {"recursion_limit": max_steps * 2 + 2},
                   )
                 except BaseException as exc:

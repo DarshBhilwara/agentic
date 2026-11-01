@@ -31,7 +31,7 @@ The existing API's `turn_id` identifies a submitted user message. It is not the
 ReAct cycle counter. Use `step_index` and `request_id` to inspect successive
 model/action/observation cycles within the run.
 
-## 1. Leave the old chat and synchronize the client files
+## 1. Leave the old chat and deploy the structured-tool recovery fix
 
 If the previous interactive chat is still open, type:
 
@@ -42,9 +42,10 @@ If the previous interactive chat is still open, type:
 Keep the previous workspaces and run records. They are separate evidence and
 will not be reused or deleted.
 
-Push the new client files from the development checkout and pull them on the
-agent host through your usual source synchronization. The sample launcher and
-exporter need `requests`; fixture preparation also needs `git`.
+Push the updated files from the development checkout and pull them on the agent
+host through your usual source synchronization. Keep existing local changes.
+The sample launcher and exporter need `requests`; fixture preparation also needs
+`git`.
 
 ```sh
 cd /home/agentic/agentic
@@ -56,8 +57,65 @@ Credentials are read from `~/.agentic_token` without printing them. If
 `AGENTCTL_GATEWAY_URL` is unset, the default is `http://localhost:30080`.
 Do not replace a working gateway URL or print your token.
 
-These are client-side changes using existing gateway features. No Kubernetes
-restart, pod rollout or application image rebuild is required for this sample.
+The earlier exporter fixes were client-side only. The new fix changes gateway
+and worker code: updating Git alone does not update running application pods.
+Build/import a fresh worker image and roll out the gateway and workers. Do not
+restart Kubernetes, delete workloads/PVCs, change the model, or rebuild vLLM or
+the kernel collector for this fix.
+
+On **iiitd-desktop**, record the live application images and check that no tasks
+are queued or processing. Arrange a quiet window before rolling out workers:
+
+```sh
+kubectl -n agentic-ai get deploy agent-worker api-gateway vllm -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[*].image,READY:.status.readyReplicas'
+kubectl -n agentic-ai exec deploy/redis -- redis-cli LLEN task_queue
+kubectl -n agentic-ai exec deploy/redis -- redis-cli LLEN task_processing
+```
+
+If either list is nonempty, wait for work to finish; do not clear queues or kill
+other programs. Preserve the previous failed sample and its telemetry.
+
+After the updated source has been committed/pushed/pulled, build on **ryzen01**:
+
+```sh
+cd /home/agentic/agentic
+SAMPLE_WORKER_REV="$(git rev-parse --short HEAD)"
+SAMPLE_WORKER_IMAGE="agentic-worker:$SAMPLE_WORKER_REV"
+git archive HEAD | docker build -t "$SAMPLE_WORKER_IMAGE" -
+```
+
+Use a new commit/tag for this build so an existing image is not silently reused.
+Compare the committed-source checksums with the built image before import:
+
+```sh
+git show HEAD:code/agent.py | sha256sum
+git show HEAD:code/gateway.py | sha256sum
+git show HEAD:code/worker.py | sha256sum
+docker run --rm --entrypoint sha256sum "$SAMPLE_WORKER_IMAGE" /app/agent.py /app/gateway.py /app/worker.py
+```
+
+The three corresponding hashes must match. Then import on that same agent node:
+
+```sh
+docker save "$SAMPLE_WORKER_IMAGE" | sudo k3s ctr images import -
+printf '%s\n' "$SAMPLE_WORKER_IMAGE"
+```
+
+On **iiitd-desktop**, set the variable to that exact printed image tag (replace
+the placeholder), then update only the affected application deployments:
+
+```sh
+SAMPLE_WORKER_IMAGE='agentic-worker:<the-new-commit-tag>'
+kubectl -n agentic-ai set image deployment/api-gateway gateway="$SAMPLE_WORKER_IMAGE"
+kubectl -n agentic-ai rollout status deployment/api-gateway --timeout=180s
+kubectl -n agentic-ai set image deployment/agent-worker worker="$SAMPLE_WORKER_IMAGE"
+kubectl -n agentic-ai rollout status deployment/agent-worker --timeout=180s
+kubectl -n agentic-ai get deploy agent-worker api-gateway vllm -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[*].image,READY:.status.readyReplicas'
+```
+
+Confirm both application deployments use the new image and are fully Ready,
+and that vLLM still uses its original image. Do not apply source manifests with
+their older `:0.1` tags. No rollout or build above has been performed for you.
 
 ## 2. Start the sample with one command
 
@@ -91,10 +149,25 @@ The launcher:
 6. Exports the terminal run's statistics and retained syscall records, then
    independently verifies the generated program on the host.
 
-The task uses the gateway's existing coding-only mode: only workspace tools are
-available, and an answer without detected workspace changes is rejected within
-the same run. This guard does not prove correctness; independent verification
-is still required.
+The task uses coding-only mode and explicitly opts into
+`require_command_execution=true`. Only workspace tools are available. A final
+answer without workspace changes is rejected; the next model request requires
+a structured `write_file` call. A final answer without a successful command after
+the latest write attempt (including a failed write) is rejected; the next request requires a structured
+`execute_command` call. Repeated failure remains bounded by the recovery count,
+step budget and deadline.
+
+Tool-call tags or JSON printed in assistant text are never parsed and executed.
+Only structured calls from the model API enter the normal tool node and receive
+tool IDs/kernel scopes. Named tool requests use guided decoding supported by
+[vLLM 0.8.5](https://docs.vllm.ai/en/v0.8.5/features/tool_calling.html); schema
+compliance does not guarantee correct code or commands. Initial guided-schema
+compilation may add latency.
+
+This policy improves actual execution, not proof of task correctness. Independent
+host verification remains required. The command guard is opt-in; normal tasks
+are not forced to run commands. Existing coding tasks receive structured write
+recovery when their completion is rejected for an unchanged workspace.
 
 If the launcher reports an unknown outcome, timeout or failure, stop and keep
 its output. Do not launch a replacement until the original task's state is
@@ -151,6 +224,12 @@ spans and worker syscall scopes.
 The export omits raw prompt/response/tool/workspace contents from reports while
 retaining safe identity fields. Numeric syscall arguments and process identifiers
 remain. Do not share the API token.
+
+The semantic identity inventory also preserves controlled recovery metadata:
+`tool_choice_mode`, `required_tool_name`, `recovery_reason`, and known completion
+rejection reasons/counts. Use these to distinguish automatic model choices from
+guard-enforced recovery. Such intervention remains visible rather than being
+presented as an unassisted model choice.
 
 ## 5. What establishes correlation
 

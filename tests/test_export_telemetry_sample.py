@@ -133,6 +133,24 @@ def test_export_rejects_nonterminal_run_before_privacy_report(tmp_path):
     assert not any(method == "POST" for method, _, _ in api.calls)
 
 
+def test_recovery_policy_metadata_preserves_known_enums_only():
+    safe = inspect._safe_recovery_policy({
+        "tool_choice_mode": "required", "required_tool_name": "write_file",
+        "recovery_reason": "workspace_unchanged", "reason": "workspace_unchanged",
+        "rejected_completions": 1, "payload": "PRIVATE_CONTENT",
+    })
+    assert safe == {
+        "tool_choice_mode": "required", "required_tool_name": "write_file",
+        "recovery_reason": "workspace_unchanged",
+        "completion_rejection_reason": "workspace_unchanged", "rejected_completions": 1,
+    }
+    assert inspect._safe_recovery_policy({
+        "tool_choice_mode": "PRIVATE_CONTENT", "required_tool_name": "PRIVATE_CONTENT",
+        "recovery_reason": "PRIVATE_CONTENT", "reason": "PRIVATE_CONTENT",
+        "rejected_completions": True,
+    }) == {}
+
+
 def test_export_preserves_retention_trimming_and_warns_if_total_changes(tmp_path):
     api = ExportApi()
     request = api.request

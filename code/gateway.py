@@ -86,7 +86,8 @@ def create_session(workspace: str = "", user: str = Depends(verify_key)):
 @app.post("/sessions/{session_id}/messages")
 def submit_message(session_id: str, prompt: str, benchmark: str = "",
                    case_id: str = "", max_steps: int = 100, timeout_seconds: int = 1800,
-                   coding_only: bool = False, user: str = Depends(verify_key)):
+                   coding_only: bool = False, require_command_execution: bool = False,
+                   user: str = Depends(verify_key)):
     session = _session(session_id, user)
     if not 1 <= max_steps <= 1000 or not 1 <= timeout_seconds <= 86400:
         raise HTTPException(400, detail="max_steps must be 1..1000 and timeout_seconds 1..86400")
@@ -104,6 +105,7 @@ def submit_message(session_id: str, prompt: str, benchmark: str = "",
             "max_steps": max_steps, "timeout_seconds": timeout_seconds,
             "enabled_tools": json.dumps(["execute_command", "read_file", "write_file", "list_directory"]) if coding_only else "",
             "require_workspace_changes": "1" if coding_only else "0",
+            "require_command_execution": "1" if require_command_execution else "0",
             "session_id": session_id, "agent_id": session["agent_id"],
             "workspace": session["workspace"],
             "benchmark": benchmark, "case_id": case_id,

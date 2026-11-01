@@ -21,12 +21,14 @@ def test_ambiguous_submit_is_not_retried_and_session_identity_is_saved(tmp_path,
     class Api:
         def __init__(self, *args):
             self.messages = 0
+            self.message_params = None
 
         def request(self, method, path, **kwargs):
             if path == "/sessions":
                 return {"session_id": "session-x", "agent_id": "agent-x"}
             if path == "/sessions/session-x/messages":
                 self.messages += 1
+                self.message_params = kwargs.get("params", {})
                 raise requests.Timeout("private prompt must not be reported")
             raise AssertionError(path)
 
@@ -42,6 +44,7 @@ def test_ambiguous_submit_is_not_retried_and_session_identity_is_saved(tmp_path,
     assert failure["task_status"] == "unknown"
     assert "private prompt" not in json.dumps(failure)
     assert api.messages == 1
+    assert api.message_params["require_command_execution"] == "true"
 
 
 def test_react_steps_join_request_and_call_ids_to_real_step_inventory(tmp_path):
