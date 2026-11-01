@@ -1,169 +1,178 @@
-# One sample run: telemetry, statistics and correlation
+# One task with multiple ReAct steps
 
-Run these commands yourself on **ryzen01 / agent-01**, from
-`/home/agentic/agentic`. This guide covers only one fresh sample run and its
-collected evidence. The commands have not been executed for you.
+Run this sample yourself on **ryzen01 / agent-01** from
+`/home/agentic/agentic`. This guide covers only the fresh sample and its
+telemetry. No tests, sample tasks or deployment changes have been executed for
+you while preparing this procedure.
 
-## 1. Use the existing deployment and login
+## Correct execution model
+
+Submit **one user request once**. The worker keeps executing its LangGraph loop
+until the task finishes, fails or reaches its limit:
+
+```text
+One session → one submitted task → one program/run ID
+
+step 1: model request → inspect files → tool observations
+step 2: model request → repair code / execute commands → observations
+step 3+: model request → further tools or final answer
+```
+
+A ReAct step here means one model request and its associated tool calls and
+observations. Multiple tools can belong to one step. The terminal model response
+also counts as an inference step, even without tools. The actual number of steps
+comes from execution; the sample does not manufacture a fixed count.
+
+Do not send a separate user message for each work stage. That would create
+separate programs. Observable model/tool choices are recorded; hidden model
+reasoning is not inspected.
+
+The existing API's `turn_id` identifies a submitted user message. It is not the
+ReAct cycle counter. Use `step_index` and `request_id` to inspect successive
+model/action/observation cycles within the run.
+
+## 1. Leave the old chat and synchronize the client files
+
+If the previous interactive chat is still open, type:
+
+```text
+/exit
+```
+
+Keep the previous workspaces and run records. They are separate evidence and
+will not be reused or deleted.
+
+Push the new client files from the development checkout and pull them on the
+agent host through your usual source synchronization. The sample launcher and
+exporter need `requests`; fixture preparation also needs `git`.
 
 ```sh
 cd /home/agentic/agentic
-ls scripts/export_telemetry_sample.py
+ls scripts/run_telemetry_sample.py scripts/export_telemetry_sample.py
 ```
 
-The exporter must be present in this host's checkout before the export step.
-If it is missing, transfer that helper to the same path first. It needs
-`requests`, like agentctl; no application rebuild is needed for the helper.
+Use your existing agentctl credential and working gateway configuration.
+Credentials are read from `~/.agentic_token` without printing them. If
+`AGENTCTL_GATEWAY_URL` is unset, the default is `http://localhost:30080`.
+Do not replace a working gateway URL or print your token.
 
-Use the gateway URL and agentctl login that already work on this host. If the
-gateway URL is unset, both clients default to `http://localhost:30080`.
-If another address is required, set it once:
+These are client-side changes using existing gateway features. No Kubernetes
+restart, pod rollout or application image rebuild is required for this sample.
 
-```sh
-export AGENTCTL_GATEWAY_URL=http://<agent-host>:30080
-```
+## 2. Start the sample with one command
 
-Do not change a working URL to the placeholder above. Credentials are read from
-`~/.agentic_token`; do not print or share that file. Keep the running telemetry
-configuration unchanged.
-
-## 2. Submit a fresh task and save the output
-
-In the same shell:
+In the agent-host shell:
 
 ```sh
-mkdir -p benchmark-workspaces
-SAMPLE_DIR="$(mktemp -d "$PWD/benchmark-workspaces/telemetry-sample-XXXXXX")"
+SAMPLE_OUTPUT="$PWD/benchmark-results/react-sample-$(date +%Y%m%d-%H%M%S)"
 
-./agentctl submit --watch -C "$SAMPLE_DIR" \
-  'Use write_file to create smoke.txt containing exactly "telemetry correlation sample" with no newline. Then use execute_command to run cat smoke.txt. Finally give a short confirmation. Do not use other tools.' \
-  | tee "$SAMPLE_DIR/submission.txt"
-```
-
-Keep the printed **task ID** and **run ID**. The task ID is the program ID.
-Do not assume a particular step count or timing; inspect what actually happened.
-
-If the command reports failure, timeout, or a connection error, stop and inspect
-that output before submitting another task. A client connection error does not
-prove that the backend stopped executing.
-
-## 3. Independently verify the file effect
-
-```sh
-cat "$SAMPLE_DIR/smoke.txt"
-printf '\n'
-```
-
-Expected text: `telemetry correlation sample`.
-
-The agent's confirmation alone does not establish the file effect. Preserve
-`submission.txt` and `smoke.txt` in the sample workspace.
-
-## 4. Export the completed run
-
-Replace the value below with the **new run ID** printed by agentctl:
-
-```sh
-SAMPLE_RUN_ID='paste-the-new-run-id-here'
-SAMPLE_EXPORT="$PWD/benchmark-results/telemetry-sample-$SAMPLE_RUN_ID"
-
-python3 scripts/export_telemetry_sample.py \
-  --run-id "$SAMPLE_RUN_ID" \
-  --output "$SAMPLE_EXPORT"
+python3 scripts/run_telemetry_sample.py \
+  --workspace-root "$PWD/benchmark-workspaces" \
+  --output "$SAMPLE_OUTPUT" \
+  --timeout 300 \
+  --max-steps 20
 ```
 
 Use the Python environment that already has `requests`; substitute
-`.venv/bin/python` if needed. The exporter accepts terminal runs only and
-requires a fresh output directory. If an export fails, preserve its
-`failure.json`; use a new output path for a retry.
+`.venv/bin/python` if needed.
 
-| File | What it contains |
+The launcher:
+
+1. Creates a fresh child workspace containing a small CSV dataset, an
+   intentionally defective analyzer and standard-library tests.
+2. Initializes a clean Git baseline **only inside that new sample workspace**.
+   This is fixture preparation, outside the captured program; the platform
+   repository and existing user workspaces are not committed or modified.
+3. Creates one fresh session and submits one coding task. The agent must inspect,
+   repair and verify the existing program using real workspace tools.
+4. Saves the accepted session/task/program/run IDs before waiting for completion.
+5. Leaves subsequent model/tool cycles to the existing worker loop. It does not
+   submit a new user request for each cycle or silently resubmit on failure.
+6. Exports the terminal run's statistics and retained syscall records, then
+   independently verifies the generated program on the host.
+
+The task uses the gateway's existing coding-only mode: only workspace tools are
+available, and an answer without detected workspace changes is rejected within
+the same run. This guard does not prove correctness; independent verification
+is still required.
+
+If the launcher reports an unknown outcome, timeout or failure, stop and keep
+its output. Do not launch a replacement until the original task's state is
+understood. A client timeout does not stop a backend task.
+If submission acknowledgement is lost, `preparation.json` retains the session
+ID for locating the accepted task without submitting another request.
+
+## 3. Understand the two separate outcomes
+
+| Result | Meaning |
 |---|---|
-| `report.json` | Program summary, model-step/tool measurements, bounded semantic events, observed graph, and a bounded kernel snapshot. |
-| `kernel.jsonl` | Paginated retained syscall records, up to the configured 10,000-record run cap. |
-| `correlation.json` | Run/program/request/step/tool identities, bounded semantic identity inventory, scope counts, representative entry/exit pairs, capture status, counters, retention and join warnings. |
+| Runtime task status | What the worker recorded: Success, Failed or Timeout. |
+| Sample assessment | Whether this particular execution provides the requested example: actual code work, independent functional verification and multiple tool-bearing ReAct steps. |
 
-The exporter reads additional identity fields from the run API without saving
-its raw prompt/response/tool payloads. The official report excludes those
-contents too. Numeric syscall arguments and process identifiers remain.
+A runtime Success with an incorrect program or insufficient action steps is
+not a validated sample. Its actual status and evidence are preserved; it is not
+relabelled as runtime failure or padded with extra user messages.
 
-## 5. Show the collected statistics and correlation
+The sample dataset contains six rows with total 350. Filtering North should
+produce count 2, total 150 and average 75. Additional cases exercise decimals,
+refunds, empty input and invalid amounts. These are validation expectations,
+not claims about what an unexecuted run produced.
 
-Run this in the same shell after a successful export:
+## 4. Inspect the saved evidence
+
+| File under `$SAMPLE_OUTPUT` | What to inspect |
+|---|---|
+| `submission.json` | Accepted session, task/program and run IDs, saved before polling. |
+| `result.json` | Actual runtime outcome and the separate verification/sample assessment. |
+| `react_steps.json` | Actual model-step sequence, request IDs, tool calls and associated correlation information. |
+| `evidence/report.json` | Program summary, model/tool timings, tokens, semantic snapshot and graph. |
+| `evidence/correlation.json` | Run/step/tool identity inventory, scope counts, representative syscall pairs, heartbeat, counters, retention and warnings. |
+| `evidence/kernel.jsonl` | The full retained run syscall snapshot, up to the per-run 10,000-record cap. |
+
+Read the launcher result and actual step sequence:
 
 ```sh
-python3 - "$SAMPLE_EXPORT" <<'PY'
-import json
-import sys
-from collections import Counter
-from pathlib import Path
-
-root = Path(sys.argv[1])
-report = json.loads((root / "report.json").read_text())["runs"][0]
-export = json.loads((root / "correlation.json").read_text())
-correlation = export["correlation"]
-inventory = correlation.get("identity_inventory", {})
-events = inventory.get("semantic_events", [])
-shown = {
-    "run_and_program": correlation.get("run"),
-    "program_statistics": report.get("summary"),
-    "model_steps_and_tool_statistics": report.get("steps"),
-    "request_step_and_tool_ids": inventory.get("steps"),
-    "semantic_event_type_counts_in_export": dict(Counter(e.get("type") for e in events)),
-    "semantic_identity_page_truncated": inventory.get("semantic_events_truncated"),
-    "procedural_graph": correlation.get("procedural_graph"),
-    "kernel_scope_counts": correlation.get("scope_counts"),
-    "kernel_record_identity_counts": correlation.get("record_identity_counts"),
-    "matched_syscall_entry_exit_pairs": correlation.get("matched_pair_count"),
-    "representative_pairs_by_scope": correlation.get("representative_pairs"),
-    "step_tool_call_ids": correlation.get("step_tool_call_ids"),
-    "kernel_tool_call_ids": correlation.get("kernel_tool_call_ids"),
-    "unjoined_kernel_tool_call_ids": correlation.get("unjoined_kernel_tool_call_ids"),
-    "tool_scope_mismatches": correlation.get("tool_scope_mismatches"),
-    "kernel_capture_retention_and_health": export.get("kernel"),
-    "correlation_warnings": correlation.get("warnings"),
-}
-text = json.dumps(shown, indent=2)
-(root / "inspection.json").write_text(text + "\n")
-print(text)
-PY
+python3 -m json.tool "$SAMPLE_OUTPUT/submission.json"
+python3 -m json.tool "$SAMPLE_OUTPUT/result.json"
+python3 -m json.tool "$SAMPLE_OUTPUT/react_steps.json"
 ```
 
-This also saves the displayed values as `inspection.json`. To inspect every
-exported semantic identity record, open `correlation.json`; to inspect raw
-retained syscall records, open `kernel.jsonl`.
+Then inspect the numeric report and syscall correlation:
 
-## What to check together
+```sh
+python3 -m json.tool "$SAMPLE_OUTPUT/evidence/report.json"
+python3 -m json.tool "$SAMPLE_OUTPUT/evidence/correlation.json"
+```
 
-| Layer / join | Evidence to inspect |
-|---|---|
-| Program | Outcome, submission-to-completion time, queue wait, attempted/completed steps, token usage, tool count/failures and tool durations. |
-| Inference | Per-step model wall time, queue/prefill/decode/forward measurements and their availability. Use the step's exact request ID for engine correlation. |
-| Semantic | Actual model/tool event sequence, file artifact events and observed graph. The identity inventory is capped at 1,000 events; counts describe this exported page. |
-| Kernel | Program, step and both tool scopes; syscall IDs, PID/TID, numeric arguments, return values and paired durations. |
-| Execution identity | The same run/program IDs in the inventory and kernel records; inspect missing/mismatched identity counts. |
-| Step identity | Step indices connect model steps, semantic events and worker kernel scopes. |
-| Tool identity | Match each tool call ID, name and step against the kernel scope. Inspect unjoined IDs and scope mismatches. |
-| Entry/exit pairing | Collector ID + PID + TID + entry monotonic timestamp + syscall ID. A representative pair should include return value and duration. |
-| Capture quality | Initial/final totals, retained/exported counts, trimmed records, heartbeat freshness, perf/map/queue/export/identity counters and all warnings. |
+The helper's host-side verification is outside the captured agent task. Only
+verification commands actually invoked through agent tools belong to its tool
+spans and worker syscall scopes.
 
-Kernel export is asynchronous: terminal task status does not guarantee that
-every record has reached Redis. If totals change during export, keep that
-snapshot and export again into a fresh directory after collection settles.
+The export omits raw prompt/response/tool/workspace contents from reports while
+retaining safe identity fields. Numeric syscall arguments and process identifiers
+remain. Do not share the API token.
 
-Missing measurements remain unknown/null. Unsupported request-scoped KV
-lifecycle fields remain null. Engine phase times overlap model wall time;
-forward time is batch-attributed. Shared vLLM syscalls are workload-attributed,
-not assigned to this request.
+## 5. What establishes correlation
 
-Do not describe retained events as lossless capture: retention trimming,
-unmatched boundaries and collection/export gaps must remain visible. A syscall
-entry and its exit are two event records. Worker scope identifies the active
-container phase, rather than proving every background syscall was caused by
-the tool.
+- One run/program identity spans all observed ReAct steps.
+- Each model step has a distinct request ID; that exact ID joins supported vLLM
+  engine measurements into the step.
+- Each real tool call has a call ID, name, index and status; compare these with
+  semantic events and worker kernel scopes.
+- A syscall entry/exit pair matches collector ID, PID, TID, entry monotonic
+  timestamp and syscall ID. Retain unmatched boundaries and scope warnings.
+- Inspect capture totals, retained/exported counts, trimming, changing totals,
+  heartbeat freshness and loss/export counters.
 
-## Share the first result
+Longer programs may exceed retention. Exports are asynchronous snapshots even
+after terminal task status. Zero reported counters do not establish lossless
+capture. Worker scope describes the active container phase, not proven causality
+for every background syscall. Shared vLLM syscalls retain workload identity only.
+Engine timings overlap model wall time; unsupported KV measurements remain null.
 
-First paste the sample submission output and host-side file output from steps
-2–3. Then share the export result and `inspection.json` so the actual collected
-values, joins and gaps can be interpreted together. Do not share the token.
+## Next checkpoint
+
+Paste the launcher output, followed by `result.json` and `react_steps.json`.
+We will inspect the actual cycles under that one run ID, then locate that run's
+trace in Phoenix. No additional user prompts are needed to advance the agent's
+internal loop.
