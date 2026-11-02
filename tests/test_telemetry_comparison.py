@@ -85,6 +85,49 @@ def test_runtime_eligibility_uses_returned_answer_not_verifier(tmp_path):
     assert reasons == []
 
 
+def test_completion_requirements_are_separate_from_workspace_tool_restriction():
+    assert comparison._completion_requirements("runtime") == {
+        "require_workspace_changes": False, "require_command_execution": False}
+    assert comparison._completion_requirements("verified") == {
+        "require_workspace_changes": True, "require_command_execution": True}
+
+
+def test_runtime_preflight_rejects_old_gateway_before_submission():
+    class Api:
+        def __init__(self, supported):
+            self.calls = []
+            self.supported = supported
+        def request(self, method, route):
+            self.calls.append((method, route))
+            return {"coding_completion_overrides": self.supported}
+    old = Api(False)
+    with pytest.raises(ValueError, match="updated gateway"):
+        comparison._check_runtime_capability(old, "runtime")
+    assert old.calls == [("GET", "/capabilities")]
+    current = Api(True)
+    comparison._check_runtime_capability(current, "runtime")
+    comparison._check_runtime_capability(old, "verified")
+    assert old.calls == [("GET", "/capabilities")]
+
+
+@pytest.mark.parametrize("missing", [None, "engine", "kernel", "program"])
+def test_answer_only_capture_still_requires_program_engine_and_kernel(missing):
+    result = comparison._capture_check(
+        {"inference_steps": 1, "tool_calls": 0}, [] if missing == "program" else [{"tools": []}],
+        0 if missing == "engine" else 1, 0 if missing == "kernel" else 10,
+        {"program": 10}, "runtime")
+    assert result["captured"] is (missing is None)
+    assert not result["tool_scopes_required"]
+
+
+def test_tool_using_runtime_capture_and_verified_capture_require_tool_scopes():
+    summary = {"inference_steps": 1, "tool_calls": 1}
+    assert not comparison._capture_check(summary, [{"tools": [{"tool_name": "read_file"}]}],
+                                         1, 10, {}, "runtime")["captured"]
+    assert not comparison._capture_check({"inference_steps": 1, "tool_calls": 0}, [{"tools": []}],
+                                         1, 10, {}, "verified")["captured"]
+
+
 def test_runtime_verifier_exception_is_diagnostic_only(tmp_path, monkeypatch):
     def fail(_workspace):
         raise OSError("host verification unavailable")

@@ -24,8 +24,10 @@ PROMPT = (
     "division. Change only the average calculation to produce a fractional average while "
     "keeping empty input as null. Then run `python3 -m unittest -v test_analyze` and "
     "`python3 analyze.py sales.csv --region North --output report.json`. Read report.json "
-    "and finish with a brief summary of observed results. Preserve the rest of the program; do not install "
-    "packages, use the internet, delegate, or merely describe commands."
+    "and finish with a summary of observed results in at most 80 tokens (about 50 words). "
+    "Use structured tools for actions; omit plans, repeated explanations, and code pasted into prose. "
+    "Preserve the rest of the program; do not install packages, use the internet, delegate, "
+    "or merely describe commands."
 )
 _OWNED_OUTPUTS = set()
 

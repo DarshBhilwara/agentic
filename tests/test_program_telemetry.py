@@ -327,6 +327,28 @@ def submit(backend, **params):
     return response.json()
 
 
+@pytest.mark.parametrize("telemetry_enabled", [True, False])
+def test_runtime_answer_without_coding_actions_completes_in_both_modes(backend, fake_model, monkeypatch,
+                                                                     telemetry_enabled):
+    r, client, path = backend
+    monkeypatch.setenv("AGENT_TELEMETRY_ENABLED", str(telemetry_enabled).lower())
+    monkeypatch.setenv("KERNEL_TELEMETRY_ENABLED", "false")
+    (path / "original.txt").write_text("unchanged")
+    fake_model.side_effect = [completion()]
+    submitted = submit(backend, coding_only=True, require_workspace_changes=False,
+                       require_command_execution=False)
+    worker.process_task(r, submitted["task_id"])
+    task = client.get(f"/tasks/{submitted['task_id']}", headers={"X-API-Key": "alice-token"}).json()
+    assert task["task_status"] == "Success"
+    assert task["result"] == "Done"
+    assert task["require_workspace_changes"] == task["require_command_execution"] == "0"
+    assert float(task["task_end_to_end_time_ms"]) >= 0
+    assert (path / "original.txt").read_text() == "unchanged"
+    assert fake_model.call_count == 1
+    assert {tool["function"]["name"] for tool in fake_model.call_args.kwargs["tools"]} == {
+        "execute_command", "read_file", "write_file", "list_directory"}
+
+
 def test_gateway_worker_program_export(backend, fake_model):
     r, client, path = backend
     fake_model.side_effect = [completion([tool()]), completion()]

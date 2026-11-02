@@ -2,6 +2,15 @@
 
 Updated 2026-11-02, Asia/Kolkata.
 
+Current policy update (2026-11-03): the user now wants runtime-only overhead for
+returned answers, not correct coding solutions. `--eligibility runtime` disables
+mandatory edits and successful commands, keeps correctness diagnostic, and allows
+zero-tool answers with on-mode program/inference/kernel evidence. Verified mode
+and single-sample correctness checks remain strict. This requires the updated
+gateway completion-override capability, synchronized clients, and a fresh plan;
+do not mix earlier series with the changed prompt or completion contract. The
+older correctness-only comparison descriptions below are historical context.
+
 ## Your role and the immediate objective
 
 Help the user execute both workflows on their research cluster:

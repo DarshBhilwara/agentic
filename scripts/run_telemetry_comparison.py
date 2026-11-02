@@ -176,7 +176,7 @@ def _write(path, value):
 
 def _workload_sha256():
     files = {"sales.csv": DATA, "analyze.py": SEED_ANALYZER, "test_analyze.py": SEED_TESTS}
-    value = {"prompt": PROMPT,
+    value = {"prompt": PROMPT, "completion_contract_version": 2,
              "files": {name: hashlib.sha256(body.encode("utf-8")).hexdigest()
                        for name, body in files.items()}}
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -212,6 +212,32 @@ def _verify_attempt(workspace, task_status, policy):
         return {"passed": False, "diagnostic_error": safe_error(exc), "commands": []}
 
 
+def _completion_requirements(policy):
+    return {"require_workspace_changes": policy == "verified",
+            "require_command_execution": policy == "verified"}
+
+
+def _check_runtime_capability(api, policy):
+    if policy == "runtime" and api.request("GET", "/capabilities").get("coding_completion_overrides") is not True:
+        raise ValueError("runtime experiments require the updated gateway completion overrides")
+
+
+def _capture_check(summary, steps, engine_steps, exported_records, scopes, policy):
+    scope_count = sum(count for key, count in scopes.items() if key.startswith("tool:"))
+    tool_count = sum(len(step.get("tools", [])) for step in steps)
+    # An answer-only run can have no tools. When tools did execute, their
+    # scopes are still required; verified coding samples always require tools.
+    scopes_required = policy == "verified" or tool_count > 0 or summary.get("tool_calls") != 0
+    return {"inference_steps": summary.get("inference_steps"),
+            "step_records_exported": len(steps), "engine_measured_steps": engine_steps,
+            "kernel_records_exported": exported_records, "tool_scope_count": scope_count,
+            "tool_scopes_required": scopes_required,
+            "captured": bool(summary.get("inference_steps", 0) > 0 and
+                             len(steps) == summary.get("inference_steps") and
+                             engine_steps == summary.get("inference_steps") and
+                             exported_records > 0 and (not scopes_required or scope_count > 0))}
+
+
 def _block_schedule():
     return [{"batch": 2 * block + position + 1, "block": block + 1, "mode": mode,
              "directory": "block-%02d/%s" % (block + 1, mode)}
@@ -225,6 +251,7 @@ def plan_blocks(args):
     root.mkdir(parents=True, exist_ok=False)
     plan = {"version": 1, "created_unix": time.time(), "repetitions": 5, "warmups": 1,
             "eligibility": "runtime", "timeout_seconds": 300, "max_steps": 20,
+            "completion_requirements": _completion_requirements("runtime"),
             "workload_sha256": _workload_sha256(), "schedule": _block_schedule()}
     _write(root / "plan.json", plan)
     print(json.dumps(plan, indent=2))
@@ -238,6 +265,9 @@ def _read_block_plan(path):
                 "timeout_seconds": 300, "max_steps": 20, "schedule": _block_schedule()}
     if any(plan.get(key) != value for key, value in expected.items()):
         raise ValueError("unsupported or altered block plan")
+    if ("completion_requirements" in plan and
+            plan["completion_requirements"] != _completion_requirements("runtime")):
+        raise ValueError("unsupported completion requirements in block plan")
     digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return path.parent, plan, digest
 
@@ -277,14 +307,16 @@ def run_mode(args):
         output.relative_to(root.resolve())
     except ValueError:
         raise ValueError("--output must be a new directory under benchmark-results")
+    api = Gateway(args.gateway, read_token(args.token_file), 30)
+    _check_runtime_capability(api, args.eligibility)
     output.mkdir(parents=True, exist_ok=False)
     workspace_root = args.workspace_root.expanduser().resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
-    api = Gateway(args.gateway, read_token(args.token_file), 30)
     metadata = {**planned, "started_unix": time.time(),
                 "mode": args.mode, "repetitions": args.repetitions, "warmups": args.warmups,
                 "timeout_seconds": args.timeout, "max_steps": args.max_steps,
                 "deployment": config, "workload_sha256": _workload_sha256(),
+                "completion_requirements": _completion_requirements(args.eligibility),
                 "measurement": {"primary": "worker task_end_to_end_time_ms, includes queue wait and synchronous ledger finalization",
                                 "secondary": "worker task_completion_time_ms, existing task timing before final ledger writes",
                                 "client_observed": "monotonic submit-to-terminal time, includes polling interval",
@@ -311,7 +343,9 @@ def run_mode(args):
             submitted = api.request("POST", "/sessions/%s/messages" % row["session_id"],
                                     params={"prompt": PROMPT, "max_steps": args.max_steps,
                                             "timeout_seconds": args.timeout,
-                                            "coding_only": "true", "require_command_execution": "true"})
+                                            "coding_only": "true",
+                                            **{key: str(value).lower() for key, value in
+                                               _completion_requirements(args.eligibility).items()}})
             row.update({key: submitted.get(key) for key in ("task_id", "program_id", "run_id")})
             if not row.get("task_id"):
                 raise RuntimeError("submission response has no task ID; outcome is ambiguous")
@@ -337,7 +371,8 @@ def run_mode(args):
             # Preserve terminal diagnostics outside the measured task boundary.
             _write(output / ("task-%02d.json" % (index + 1)), {
                 key: task.get(key) for key in ("id", "task_id", "run_id", "status", "task_status",
-                    "error", "task_end_to_end_time_ms", "task_completion_time_ms")})
+                    "error", "task_end_to_end_time_ms", "task_completion_time_ms",
+                    "require_workspace_changes", "require_command_execution")})
             row["stage"] = "verification"
             verification = _verify_attempt(workspace, row["task_status"], args.eligibility)
             _write(output / ("verification-%02d.json" % (index + 1)), verification)
@@ -358,26 +393,21 @@ def run_mode(args):
                                            params={"offset": 0, "limit": 10000})
                     engine_steps = sum(step.get("engine_metrics_status") == "available"
                                        for step in measured.get("steps", []))
-                    step_count = len(steps)
-                    row["telemetry_capture_check"] = {
-                        "inference_steps": summary.get("inference_steps"),
-                        "step_records_exported": step_count,
-                        "engine_measured_steps": engine_steps,
-                        "kernel_records_exported": row["telemetry_export"].get("exported_records"),
-                        "tool_scope_count": sum(count for key, count in scopes.items()
-                                                 if key.startswith("tool:")),
-                        "captured": bool(summary.get("inference_steps", 0) > 0 and
-                                         step_count == summary.get("inference_steps") and
-                                         engine_steps == summary.get("inference_steps") and
-                                         row["telemetry_export"].get("exported_records", 0) > 0 and
-                                         any(key.startswith("tool:") and count > 0
-                                             for key, count in scopes.items()))}
+                    row["telemetry_capture_check"] = _capture_check(
+                        summary, steps, engine_steps, row["telemetry_export"].get("exported_records", 0),
+                        scopes, args.eligibility)
                 except Exception as exc:
                     row["telemetry_export_error"] = safe_error(exc)
             capture_verified = row.get("telemetry_capture_check", {}).get("captured") is True
             row["eligible"], row["exclusion_reasons"] = _eligibility(
                 args.mode, args.eligibility, warmup, row["task_status"], task.get("result"),
                 row["task_end_to_end_time_ms"], verification.get("passed"), capture_verified)
+            row["completion_requirements_match"] = all(
+                str(task.get(key)) == ("1" if value else "0")
+                for key, value in _completion_requirements(args.eligibility).items())
+            if not row["completion_requirements_match"]:
+                row["eligible"] = False
+                row["exclusion_reasons"].append("completion_requirements_not_applied")
             row["stage"] = "complete"
         except Exception as exc:
             row["runner_error"] = safe_error(exc)
@@ -434,6 +464,7 @@ def compare(args):
         "max_steps": on_meta.get("max_steps") == off_meta.get("max_steps"),
         "requested_repetitions": on_meta.get("repetitions") == 5 and off_meta.get("repetitions") == 5,
         "eligibility_policy": on_policy == off_policy,
+        "completion_requirements": on_meta.get("completion_requirements") == off_meta.get("completion_requirements"),
     }
     on_values = [row["task_end_to_end_time_ms"] for row in on_rows if row.get("eligible") and not row.get("warmup")]
     off_values = [row["task_end_to_end_time_ms"] for row in off_rows if row.get("eligible") and not row.get("warmup")]
@@ -530,6 +561,9 @@ def compare_blocks(args):
                     or meta.get("repetitions") != 5 or meta.get("warmups") != 1
                     or meta.get("timeout_seconds") != 300 or meta.get("max_steps") != 20 or policy != "runtime"):
                 reasons.append(label + ": metadata differs from plan")
+            if ("completion_requirements" in plan and
+                    meta.get("completion_requirements") != plan["completion_requirements"]):
+                reasons.append(label + ": completion requirements differ from plan")
             config = meta.get("deployment", {}).get("comparable_sha256")
             if not isinstance(config, str) or not config:
                 reasons.append(label + ": missing deployment configuration hash")
@@ -543,6 +577,8 @@ def compare_blocks(args):
             batch_values = []
             for position, row in enumerate(rows):
                 warmup = row.get("warmup") is True
+                if "completion_requirements" in plan and row.get("completion_requirements_match") is not True:
+                    reasons.append(label + ": attempt completion requirements were not applied")
                 if (row.get("index") != position + 1 or warmup != (position == 0)
                         or row.get("mode") != mode or row.get("stage") != "complete"):
                     reasons.append(label + ": invalid attempt sequence or incomplete outcome")

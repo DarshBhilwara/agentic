@@ -14,6 +14,7 @@ def _series(tmp_path):
     root.mkdir()
     plan = {"version": 1, "created_unix": 1, "repetitions": 5, "warmups": 1,
             "eligibility": "runtime", "timeout_seconds": 300, "max_steps": 20,
+            "completion_requirements": comparison._completion_requirements("runtime"),
             "workload_sha256": "workload", "schedule": comparison._block_schedule()}
     (root / "plan.json").write_text(json.dumps(plan))
     _, _, digest = comparison._read_block_plan(root / "plan.json")
@@ -24,11 +25,13 @@ def _series(tmp_path):
                 "plan_block": batch["block"], "workload_sha256": "workload",
                 "repetitions": 5, "warmups": 1, "timeout_seconds": 300, "max_steps": 20,
                 "measurement": {"eligibility_policy": "runtime"},
+                "completion_requirements": comparison._completion_requirements("runtime"),
                 "deployment": {"comparable_sha256": "config"},
                 "started_unix": batch["batch"] * 10, "completed_unix": batch["batch"] * 10 + 5}
         (path / "experiment.json").write_text(json.dumps(meta))
         rows = [{"index": i + 1, "mode": batch["mode"], "stage": "complete", "warmup": i == 0,
                  "eligible": i != 0, "task_status": "Success", "task_result_nonempty": True,
+                 "completion_requirements_match": True,
                  "task_id": "%s-task-%s" % (batch["batch"], i),
                  "run_id": "%s-run-%s" % (batch["batch"], i),
                  "task_end_to_end_time_ms": 999999 if i == 0 else (110 if batch["mode"] == "on" else 100),
@@ -55,7 +58,7 @@ def test_complete_series_excludes_warmups_and_reports_paired_interval(tmp_path):
 
 
 @pytest.mark.parametrize("defect", ["missing_batch", "failure", "duplicate", "config", "policy",
-                                    "order", "capture", "nan", "warmup_failed"])
+                                    "order", "capture", "nan", "warmup_failed", "warmup_contract"])
 def test_series_withholds_estimate_for_invalid_or_incomplete_data(tmp_path, defect):
     root = _series(tmp_path)
     batch = root / "block-02/off"
@@ -83,6 +86,8 @@ def test_series_withholds_estimate_for_invalid_or_incomplete_data(tmp_path, defe
         rows[1]["task_end_to_end_time_ms"] = float("nan")
     elif defect == "warmup_failed":
         rows[0]["task_status"] = "Failed"
+    elif defect == "warmup_contract":
+        rows[0]["completion_requirements_match"] = False
     if defect != "missing_batch":
         metadata.write_text(json.dumps(meta))
     results.write_text("".join(json.dumps(row) + "\n" for row in rows))

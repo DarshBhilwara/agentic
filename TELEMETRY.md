@@ -296,6 +296,13 @@ the correctness requirements described below. Neither policy retries failed
 attempts or includes warmups; both require matching configuration and on-mode
 capture. A runtime-only result concerns returned answers, not verified solutions.
 
+Runtime-only comparison submissions disable mandatory edits and successful
+commands; they still offer the workspace tools. On-mode capture accepts zero-tool
+answers with program, inference, and kernel records, and requires tool scopes
+when tools execute. The updated gateway advertises completion overrides through
+authenticated `/capabilities`; the client refuses older gateways before any task
+submission. This changes the workload contract and requires fresh experiment plans.
+
 The end-to-end procedure is documented in [`test.md`](test.md). `scripts/run_telemetry_sample.py` runs the single small CSV repair task: inspect the existing files, fix floor division in the average, run tests, generate a North-filtered JSON report and read it. Suitability requires independent correctness verification, at least two actual tool-bearing steps, and a successful final no-tool step. A single successful sample establishes evidence for that path; it is not an overhead estimate.
 
 `scripts/run_telemetry_comparison.py` separately runs the same task sequentially with task telemetry on and off, exactly five measured attempts per mode and one separate warmup by default. It records workload and deployment configuration hashes and rejects incompatible comparisons. Use the same image/configuration, model, timeout, step budget and verification criteria, keep background host load stable, and retain each repetition's outputs.

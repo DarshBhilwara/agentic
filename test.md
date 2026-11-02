@@ -273,6 +273,20 @@ on-mode capture plus matching workload/configuration are still required. This
 measures runtime for returned answers, not time to a correct solution. Different
 answer lengths and tool paths remain a source of variation.
 
+Runtime-only batches explicitly disable mandatory workspace changes and
+successful commands, while keeping the same four workspace tools available.
+A direct answer can qualify without tool calls; on-mode program, inference,
+and kernel evidence are still required. Tool scopes are required when tools
+execute. Verified batches and the single sample retain strict coding requirements.
+
+Deploy the updated gateway first: the client checks authenticated `/capabilities`
+before creating batch output or submitting tasks, and records the actual
+completion flags from terminal task data. The gateway accepts explicit
+`require_workspace_changes=false`; omitting it preserves the `coding_only`
+default. Existing workers already consume these flags, so only the gateway
+needs an application rollout. The changed completion contract changes the
+workload fingerprint: use a fresh plan and preserve older series.
+
 The default `--eligibility verified` keeps the stricter correctness criterion
 described below. Never mix the two policies in one on/off comparison or relabel
 old batches to make them eligible.
@@ -439,6 +453,13 @@ kubectl -n agentic-ai rollout status daemonset/kernel-telemetry --timeout=300s
 ## Next checkpoint
 
 ### Larger runtime-only experiment: 50 measured tasks per mode
+
+The shared task prompt requests a final summary of at most 80 tokens (about 50
+words) and minimal narrative. This is an instruction, not a hard token cap;
+structured tool responses retain the existing 4096-token allowance. Changing
+this prompt changes the workload hash. Preserve and pause any older series and
+create a fresh plan rather than mixing prompt versions. A shorter final answer
+does not by itself resolve failed tools or prove the cause of a runtime failure.
 
 Create a new plan on **ryzen01**, preserving all prior batches:
 
