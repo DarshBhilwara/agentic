@@ -134,6 +134,56 @@ protocol; it does not create gateway runs or authenticate users on their behalf.
 
 ## Future Kubernetes deployment and smoke checks
 
+### Relocate one node's archive without changing the DaemonSet
+
+The research collector can grow `/var/log/agentic-kernel` without rotation.
+To move only the `iiitd-desktop` archive onto its Documents filesystem, keep
+the DaemonSet hostPath unchanged and bind-mount the relocated directory at the
+same host path. Do not change the shared DaemonSet path: it also runs on
+`agent-01`. This procedure requires an administrator for the systemd mount.
+
+1. Choose a quiet window. Confirm Redis `task_queue` and `task_processing` are
+   empty, then set `KERNEL_CAPTURE_ENABLED=false` and wait for the
+   `kernel-telemetry` DaemonSet rollout to finish. This stops collection and
+   closes the archive writer on both nodes.
+2. On `iiitd-desktop`, confirm
+   `/home/iiitd/Documents/agentic-kernel` does not exist; stop if it exists.
+   Record a file listing and checksums, then move `/var/log/agentic-kernel`
+   there with metadata preserved. This is a cross-filesystem move: compare the
+   destination listing and checksums before proceeding. Stop on any error and
+   do not remove, truncate, or rotate archived evidence.
+3. Install a systemd mount unit named
+   `/etc/systemd/system/var-log-agentic\x2dkernel.mount` with:
+
+   ```ini
+   [Unit]
+   Description=Agentic kernel archive on Documents storage
+   RequiresMountsFor=/home/iiitd/Documents
+
+   [Mount]
+   What=/home/iiitd/Documents/agentic-kernel
+   Where=/var/log/agentic-kernel
+   Type=none
+   Options=bind
+
+   [Install]
+   WantedBy=local-fs.target
+   ```
+
+   Reload systemd, enable and start this mount unit, then use `findmnt` to
+   verify `/var/log/agentic-kernel` is backed by the Documents filesystem.
+   Add a systemd drop-in for `k3s.service` containing
+   `RequiresMountsFor=/var/log/agentic-kernel`, then reload systemd so future
+   K3s starts wait for the archive mount. This changes a shared cluster service;
+   coordinate it with the administrator. Reloading systemd does not require
+   restarting K3s. Do not restart K3s as part of this migration.
+4. Restore `KERNEL_CAPTURE_ENABLED=true` and wait for rollout. Verify collector
+   readiness and that new archive records appear under the bound directory.
+
+This moves only the inference-node archive. Redis run records and all
+`agent-01` archives remain in place. Shared system journals are not part of
+this migration.
+
 1. Check Linux cgroup v2, BPF/tracepoint support, mounted tracefs, and matching
    BCC-compatible kernel headers on both nodes. The collector needs privileged
    execution, host PID visibility, the host cgroup namespace, and read-only

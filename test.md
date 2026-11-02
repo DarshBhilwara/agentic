@@ -264,6 +264,19 @@ Engine timings overlap model wall time; unsupported KV measurements remain null.
 
 ## 6. Compare end-to-end runtime with telemetry on and off
 
+Before either batch, install the inference readiness gate on iiitd-desktop:
+
+```sh
+kubectl -n agentic-ai patch deployment/vllm --type strategic --patch-file manifests/inference-readiness.patch.json
+kubectl -n agentic-ai rollout status deployment/vllm --timeout=600s
+```
+
+The `/health` readiness probe keeps inference out of service endpoints until
+the API responds successfully. Without it, rollout success can precede model
+loading and tasks can fail with connection refused. Stop on rollout failure;
+save fresh deployment snapshots after installing this patch, and retain the
+same probe in both modes. Do not apply the base manifest's placeholder images.
+
 The comparison runner submits the same small CSV task sequentially, once as a
 warmup and five measured repetitions per mode. The primary metric is
 `task_end_to_end_time_ms` from the gateway task record; it includes queue wait
