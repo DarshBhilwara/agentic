@@ -48,18 +48,22 @@ value and duration when available, plus supplied scope metadata. Pair entry and
 exit by collector ID, PID, TID, and `entry_monotonic_ns`; perf buffers on different
 CPUs need not deliver global timestamp order. Exit records retain the scope
 observed at entry. `unmatched_exit` marks a syscall whose entry was not observed;
-its return is available but its arguments and duration are unknown. Nonreturning
-calls, crashes, probe restarts, and dropped events can leave an entry without an
-exit. Numeric pointers are addresses; paths, buffers, and structures are not
+its return is available but its arguments and duration are unknown. If a thread
+exits with an in-flight syscall, `process_exit_unmatched` records the observed
+entry and its process-exit disposition without inventing a return value.
+Nonreturning calls, crashes, probe restarts, and dropped events can still leave
+an entry without a matching exit or process-exit marker. Numeric pointers are
+addresses; paths, buffers, and structures are not
 dereferenced. Syscall numbers need the node architecture/ABI for decoding;
 compatibility ABIs are not normalized by this collector.
 
 ## Storage and completeness
 
 The callback queues records without Redis or file I/O. A background writer
-writes rotating node-local JSONL archives and sends correlated records to a
-separate bounded Redis list. It does not put every syscall into the semantic
-ledger or export every syscall as an OTel span.
+writes node-local JSONL archives, optionally rotates them by configured size,
+and sends correlated records to per-run Redis lists. Count trimming is disabled
+when `KERNEL_REDIS_MAX_EVENTS=0`. It does not put every syscall into the
+semantic ledger or export every syscall as an OTel span.
 
 `GET /telemetry/runs/{run_id}/kernel?offset=0&limit=500` checks the existing run
 owner, returns `records`, retention counts, `truncated`, capture status, and
@@ -85,18 +89,25 @@ Node archives survive pod replacement, but not loss of the node's disk.
 | `KERNEL_INFERENCE_SYSCALLS_ENABLED` | `true` |
 | `KERNEL_SOCKET` | `/run/agentic-kernel/collector.sock` |
 | `KERNEL_ARCHIVE` | `/var/log/agentic-kernel` |
-| `KERNEL_ARCHIVE_MAX_BYTES` | 67,108,864 bytes per archive file |
+| `KERNEL_ARCHIVE_MAX_BYTES` | 67,108,864 bytes per file; `0` disables rotation |
 | `KERNEL_ARCHIVE_FILES` | 5 rotated files, plus the active file |
-| `KERNEL_REDIS_TTL` | 2,592,000 seconds |
-| Redis records per run | Newest 10,000 |
+| `KERNEL_REDIS_TTL` | 0 (no expiry) |
+| `KERNEL_REDIS_MAX_EVENTS` | `0`: retain all records until TTL; positive value keeps the newest N |
 | Userspace queue | 16,384 records |
 | In-flight syscall map | 65,536 entries |
 | `KERNEL_DISCOVERY_INTERVAL_SECONDS` | 5 |
 | `KERNEL_IDENTITY_TTL_SECONDS` | 3,600 for inactive identities |
 | `KERNEL_IDENTITY_LIMIT` | 65,536, with live/in-flight scopes retained |
 
-Archives can exceed their nominal file threshold by one record. Storage and
-buffers are finite; measure overhead and losses at your actual syscall rate.
+With the manifest defaults, Redis keeps all per-run records without expiry, and
+node archives do not rotate. Redis memory and node disk usage therefore grow
+without a bound until an operator intervenes; capacity planning and external
+monitoring are required. Setting `KERNEL_REDIS_TTL` to a positive value expires
+Redis records after that many seconds. Setting `KERNEL_ARCHIVE_MAX_BYTES` to a
+positive value enables size/count rotation; archives can exceed the size limit
+by one record. The userspace queue, BPF maps, perf buffers, outages, and node
+disk failures can still cause missing records, so this configuration prevents
+automatic retention trimming but does not promise lossless capture.
 The socket, raw archives, and Redis are intended for trusted research workloads.
 The syscall layer's numeric argument capture is independent of the semantic
 content-redaction setting.
@@ -144,10 +155,11 @@ protocol; it does not create gateway runs or authenticate users on their behalf.
 5. Run consecutive programs in one worker and exercise failure/timeout paths.
    Ensure scope restoration and ownership prevent cross-run relabelling. Check
    inference node archives for pod metadata and absent exclusive run IDs.
-6. Stop a collector, interrupt Redis, exceed retention, and generate a burst of
-   syscalls. Verify enabled-worker failures, stale/missing heartbeat reporting,
-   loss counters, bounded archives, and `truncated`. Compare overhead with capture
-   disabled before using kernel measurements in research results.
+6. Stop a collector, interrupt Redis, configure a finite retention limit, and
+   generate a burst of syscalls. Verify enabled-worker failures, stale/missing
+   heartbeat reporting, loss counters, configured archive rotation, and
+   `truncated`. Compare overhead with capture disabled before using kernel
+   measurements in research results.
 
 Local validation runs Python tests, manifest rendering/parsing, compilation, and
 shell syntax checks. It cannot validate BPF verifier acceptance, actual syscall

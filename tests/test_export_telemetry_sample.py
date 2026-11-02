@@ -196,3 +196,23 @@ def test_pair_retains_exit_scope_mismatch_as_warning():
     assert any("scope differs" in warning for warning in result["warnings"])
 
 
+def test_process_exit_disposition_explains_unpaired_entry_without_fake_return():
+    entry = _kernel_record(1, step=1, tool="execute_command", call_id="call-exit")
+    disposition = dict(entry, type="process_exit_unmatched", timestamp="process-exit",
+                       monotonic_ns=2000, ret=None, duration_ns=None)
+    result = inspect.correlate([entry, disposition], "run-1", "program-1")
+    assert result["matched_pair_count"] == 0
+    assert result["unmatched_entries"] == []
+    assert result["process_exit_unmatched"][0]["tool_call_id"] == "call-exit"
+    assert any("process exited" in warning for warning in result["warnings"])
+
+
+def test_export_can_explicitly_cap_kernel_records(tmp_path):
+    output = tmp_path / "capped-export"
+    result = inspect.export_run(ExportApi(), "run-1", output, max_kernel_records=10)
+    assert result["exported_records"] == 10
+    correlation = json.loads((output / "correlation.json").read_text())
+    assert any("intentionally capped at 10" in warning
+               for warning in correlation["correlation"]["warnings"])
+
+

@@ -38,6 +38,8 @@ CAPTURE_ENABLED = os.getenv("KERNEL_CAPTURE_ENABLED", "true").strip().lower() no
 INFERENCE_CAPTURE_ENABLED = os.getenv("KERNEL_INFERENCE_SYSCALLS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 IDENTITY_TTL_NS = int(os.getenv("KERNEL_IDENTITY_TTL_SECONDS", "3600")) * 1_000_000_000
 IDENTITY_LIMIT = int(os.getenv("KERNEL_IDENTITY_LIMIT", "65536"))
+REDIS_MAX_EVENTS = int(os.getenv("KERNEL_REDIS_MAX_EVENTS", "0"))
+REDIS_TTL = int(os.getenv("KERNEL_REDIS_TTL", "2592000"))
 
 PROGRAM = r"""
 #include <uapi/linux/ptrace.h>
@@ -81,6 +83,15 @@ TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
 }
 TRACEPOINT_PROBE(sched, sched_process_exit) {
   u64 key = bpf_get_current_pid_tgid();
+  struct inflight_t *v = inflight.lookup(&key);
+  if (v) {
+    struct event_t e = {};
+    e.ts = bpf_ktime_get_ns(); e.duration = e.ts - v->start;
+    e.scope = v->scope; e.cgroup = v->cgroup; e.pid = key >> 32;
+    e.tid = key; e.uid = bpf_get_current_uid_gid(); e.id = v->id;
+    e.kind = 3; __builtin_memcpy(e.args, v->args, sizeof(e.args));
+    bpf_get_current_comm(&e.comm, sizeof(e.comm)); events.perf_submit(args, &e, sizeof(e));
+  }
   inflight.delete(&key);
   return 0;
 }
@@ -285,6 +296,8 @@ def publish_run_status(scope):
 
 
 def rotate_archive(path):
+    if MAX_BYTES <= 0:
+        return
     if os.path.exists(path) and os.path.getsize(path) >= MAX_BYTES:
         for i in range(MAX_FILES - 1, 0, -1):
             old, new = f"{path}.{i}", f"{path}.{i+1}"
@@ -300,13 +313,20 @@ def export_run_event(client, value):
     key = f"kernel:run:{run}"
     pipe = client.pipeline()
     pipe.rpush(key, json.dumps(value, separators=(",", ":")))
-    pipe.ltrim(key, -10000, -1)
-    pipe.expire(key, int(os.getenv("KERNEL_REDIS_TTL", "2592000")))
+    if REDIS_MAX_EVENTS > 0:
+        pipe.ltrim(key, -REDIS_MAX_EVENTS, -1)
+    if REDIS_TTL > 0:
+        pipe.expire(key, REDIS_TTL)
+    else:
+        pipe.persist(key)
     pipe.hincrby(f"{key}:status", "events", 1)
     pipe.hset(f"{key}:status", "node", NODE)
     pipe.hset(f"{key}:status", mapping={name: COUNTS[name] for name in
              ("perf_lost", "map_overflow", "queue_drops", "export_errors", "identity_misses")})
-    pipe.expire(f"{key}:status", int(os.getenv("KERNEL_REDIS_TTL", "2592000")))
+    if REDIS_TTL > 0:
+        pipe.expire(f"{key}:status", REDIS_TTL)
+    else:
+        pipe.persist(f"{key}:status")
     pipe.execute()
 
 
@@ -315,7 +335,10 @@ def mark_run_active(client, run_id):
     pipe = client.pipeline()
     pipe.hset(key, mapping={"node": NODE, "capture_started_unix": time.time()})
     pipe.hsetnx(key, "events", 0)
-    pipe.expire(key, int(os.getenv("KERNEL_REDIS_TTL", "2592000")))
+    if REDIS_TTL > 0:
+        pipe.expire(key, REDIS_TTL)
+    else:
+        pipe.persist(key)
     pipe.execute()
 
 
@@ -359,11 +382,12 @@ def health_writer():
 
 
 def event_record(e, offset_ns):
-    kind = "unmatched_exit" if e.kind == 2 else "exit" if e.kind else "entry"
+    kind = {0: "entry", 1: "exit", 2: "unmatched_exit",
+            3: "process_exit_unmatched"}.get(int(e.kind), "unknown")
     scope = identity_for(int(e.scope))
     if e.scope and not scope:
         COUNTS["identity_misses"] += 1
-    entry_ts = (int(e.ts) - int(e.duration) if kind == "exit" else
+    entry_ts = (int(e.ts) - int(e.duration) if kind in {"exit", "process_exit_unmatched"} else
                 int(e.ts) if kind == "entry" else None)
     return {"collector_id": COLLECTOR_ID, "node": NODE, "type": kind,
             "architecture": platform.machine(),

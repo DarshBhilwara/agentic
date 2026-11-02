@@ -272,6 +272,8 @@ def test_redis_export_is_bounded_and_archive_rotation_is_bounded(monkeypatch, tm
         def pipeline(self): self.pipe = Pipeline(); return self.pipe
 
     client = FakeRedis()
+    monkeypatch.setattr(collector, "REDIS_MAX_EVENTS", 10000)
+    monkeypatch.setattr(collector, "REDIS_TTL", 2592000)
     collector.export_run_event(client, {"run_id": "r1", "type": "entry"})
     assert any(call[:4] == ("ltrim", "kernel:run:r1", -10000, -1) for call in client.pipe.calls)
     assert any(call[0] == "hincrby" for call in client.pipe.calls)
@@ -289,3 +291,33 @@ def test_redis_export_is_bounded_and_archive_rotation_is_bounded(monkeypatch, tm
     assert archive.with_name("node.jsonl.1").read_text() == "current"
     assert archive.with_name("node.jsonl.2").read_text() == "one"
     assert archive.with_name("node.jsonl.3").read_text() == "two"
+
+
+def test_redis_export_can_retain_all_records_without_expiry(monkeypatch):
+    class Pipeline:
+        def __init__(self): self.calls = []
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: self.calls.append((name, *args, kwargs))
+        def execute(self): return self.calls
+    class FakeRedis:
+        def pipeline(self): self.pipe = Pipeline(); return self.pipe
+
+    monkeypatch.setattr(collector, "REDIS_MAX_EVENTS", 0)
+    monkeypatch.setattr(collector, "REDIS_TTL", 0)
+    client = FakeRedis()
+    collector.export_run_event(client, {"run_id": "r1", "type": "entry"})
+    assert not any(call[0] == "ltrim" for call in client.pipe.calls)
+    assert not any(call[0] == "expire" for call in client.pipe.calls)
+    assert any(call[:2] == ("persist", "kernel:run:r1") for call in client.pipe.calls)
+    assert any(call[:2] == ("persist", "kernel:run:r1:status") for call in client.pipe.calls)
+    collector.mark_run_active(client, "r2")
+    assert any(call[:2] == ("persist", "kernel:run:r2:status") for call in client.pipe.calls)
+
+
+def test_zero_archive_limit_disables_rotation(monkeypatch, tmp_path):
+    monkeypatch.setattr(collector, "MAX_BYTES", 0)
+    archive = tmp_path / "node.jsonl"
+    archive.write_text("preserve")
+    collector.rotate_archive(str(archive))
+    assert archive.read_text() == "preserve"
+    assert not archive.with_name("node.jsonl.1").exists()

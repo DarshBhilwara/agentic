@@ -13,8 +13,8 @@
     content_capture: 'full',
     retention_days: 30,
     max_events_per_run: 10000,
-    kernel_retention_days: 30,
-    archive_mb: 64,
+    kernel_retention_days: 0,
+    archive_mb: 0,
     archive_files: 5,
     discovery_seconds: 5,
     worker_replicas: 2,
@@ -397,7 +397,7 @@
       ['Inference workload syscalls', 'Host metrics', 'Traces', 'Metrics', 'Logs']
     ],
     ['Capture & retention', ['content_capture', 'retention_days', 'max_events_per_run', 'kernel_retention_days', 'archive_mb', 'archive_files'],
-      ['Content capture', 'Run retention (days)', 'Maximum events per run', 'Kernel retention (days)', 'Archive size (MB)', 'Archive files']
+      ['Content capture', 'Run retention (days)', 'Maximum events per run', 'Kernel retention (days; 0 = no expiry)', 'Archive size (MB; 0 = no rotation)', 'Archive files']
     ],
     ['Discovery & workloads', ['device_discovery_enabled', 'discovery_seconds', 'worker_replicas', 'agent_root', 'inference_cache', 'model_name', 'vllm_url'],
       ['Read-only device discovery', 'Discovery interval (seconds)', 'Worker replicas', 'Agent root path', 'Inference cache path', 'Model name', 'vLLM endpoint']
@@ -415,7 +415,7 @@
         text: name
       }), el('p', {
         class: 'form-section-intro',
-        text: name === 'Layers' ? 'Enable or disable each instrumentation layer in the draft.' : name === 'Signals & scope' ? 'Select supporting signals and inference workload capture.' : name === 'Capture & retention' ? 'Bound captured content, archive size and record retention.' : 'Set workload paths and collector discovery parameters.'
+        text: name === 'Layers' ? 'Enable or disable each instrumentation layer in the draft.' : name === 'Signals & scope' ? 'Select supporting signals and inference workload capture.' : name === 'Capture & retention' ? 'Zero keeps kernel records and node archives without automatic expiry or rotation; monitor Redis and disk capacity.' : 'Set workload paths and collector discovery parameters.'
       }));
       const grid = el('div', {
         class: 'setting-grid'
@@ -442,7 +442,8 @@
     const errors = [];
     for (const k of ['retention_days', 'max_events_per_run', 'kernel_retention_days', 'archive_mb', 'archive_files', 'discovery_seconds', 'worker_replicas']) {
       const n = Number(draft[k]);
-      if (!Number.isInteger(n) || n < 1) errors.push(`${k.replaceAll('_',' ')} must be a positive whole number.`)
+      const minimum = ['kernel_retention_days', 'archive_mb'].includes(k) ? 0 : 1;
+      if (!Number.isInteger(n) || n < minimum) errors.push(`${k.replaceAll('_',' ')} must be a whole number of at least ${minimum}.`)
     }
     for (const k of ['agent_root', 'inference_cache', 'model_name', 'vllm_url'])
       if (!String(draft[k]).trim()) errors.push(`${k.replaceAll('_',' ')} is required.`);

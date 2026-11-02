@@ -21,7 +21,16 @@ class StepLimitExceeded(RuntimeError):
 
 
 ENGINE_FIELDS = (
-    "step_t_reasoning_ms", "prefill_time_ms", "decode_time_ms",
+    "measurement_source", "step_t_reasoning_ms", "model_forward_time_ms",
+    "model_execute_time_ms", "scheduler_time_ms", "time_to_first_token_ms",
+    "end_to_end_latency_ms", "output_tokens", "output_tokens_per_second",
+    "prefix_cached_tokens", "sequence_count", "kv_measurement", "kv_measurement_reason",
+    "kv_gpu_exclusive_blocks_at_finish", "kv_cpu_exclusive_blocks_at_finish",
+    "kv_gpu_exclusive_peak_blocks", "kv_cpu_exclusive_peak_blocks",
+    "kv_gpu_exclusive_block_ms", "kv_cpu_exclusive_block_ms",
+    "kv_swap_out_exclusive_blocks", "kv_swap_in_exclusive_blocks", "kv_shared_blocks_observed",
+    "kv_recompute_discarded_exclusive_blocks",
+    "prefill_time_ms", "decode_time_ms",
     "inference_queue_time_ms", "kv_recomputed_tokens", "kv_retained_tokens",
     "kv_evicted_tokens", "kv_restored_tokens", "kv_memory_tier", "kv_eviction_cause",
     "kv_residency", "cache_affinity_hit", "inference_replica_id",
@@ -37,6 +46,28 @@ class StepRecord:
     step_time_ms: float = 0
     llm_inference_time_ms: float = 0
     step_t_reasoning_ms: float | None = None
+    measurement_source: str | None = None
+    model_forward_time_ms: float | None = None
+    model_execute_time_ms: float | None = None
+    scheduler_time_ms: float | None = None
+    time_to_first_token_ms: float | None = None
+    end_to_end_latency_ms: float | None = None
+    output_tokens: int | None = None
+    output_tokens_per_second: float | None = None
+    prefix_cached_tokens: int | None = None
+    sequence_count: int | None = None
+    kv_measurement: str | None = None
+    kv_measurement_reason: str | None = None
+    kv_gpu_exclusive_blocks_at_finish: int | None = None
+    kv_cpu_exclusive_blocks_at_finish: int | None = None
+    kv_gpu_exclusive_peak_blocks: int | None = None
+    kv_cpu_exclusive_peak_blocks: int | None = None
+    kv_gpu_exclusive_block_ms: float | None = None
+    kv_cpu_exclusive_block_ms: float | None = None
+    kv_swap_out_exclusive_blocks: int | None = None
+    kv_swap_in_exclusive_blocks: int | None = None
+    kv_shared_blocks_observed: int | None = None
+    kv_recompute_discarded_exclusive_blocks: int | None = None
     step_t_acting_ms: float = 0
     prefill_time_ms: float | None = None
     decode_time_ms: float | None = None
@@ -119,11 +150,23 @@ class ProgramTelemetry:
             "total_tool_ttf_ms": sum(t.get("tool_ttf_ms", 0) for s in self.steps for t in s.tools),
             "total_tool_wait_time_ms": total("step_t_acting_ms"),
             "total_reasoning_time_ms": total("step_t_reasoning_ms"),
+            "total_model_forward_time_ms": total("model_forward_time_ms"),
             "total_prefill_time_ms": total("prefill_time_ms"),
             "total_decode_time_ms": total("decode_time_ms"),
             "total_inference_queue_time_ms": total("inference_queue_time_ms"),
+            "total_model_execute_time_ms": total("model_execute_time_ms"),
+            "total_scheduler_time_ms": total("scheduler_time_ms"),
+            "total_time_to_first_token_ms": total("time_to_first_token_ms"),
+            "total_end_to_end_latency_ms": total("end_to_end_latency_ms"),
             "total_prompt_tokens": total("prompt_tokens"),
             "total_completion_tokens": total("completion_tokens"),
+            "total_output_tokens": total("output_tokens"),
+            "total_prefix_cached_tokens": total("prefix_cached_tokens"),
+            "total_kv_gpu_exclusive_block_ms": total("kv_gpu_exclusive_block_ms"),
+            "total_kv_cpu_exclusive_block_ms": total("kv_cpu_exclusive_block_ms"),
+            "total_kv_swap_out_exclusive_blocks": total("kv_swap_out_exclusive_blocks"),
+            "total_kv_swap_in_exclusive_blocks": total("kv_swap_in_exclusive_blocks"),
+            "total_kv_recompute_discarded_exclusive_blocks": total("kv_recompute_discarded_exclusive_blocks"),
             "context_tokens": self.steps[-1].context_tokens if self.steps else None,
             "peak_context_tokens": max((s.context_tokens for s in self.steps if s.context_tokens is not None), default=None),
             "kv_recomputed_tokens": total("kv_recomputed_tokens"),
@@ -144,7 +187,7 @@ class ProgramTelemetry:
 
 def collect_engine_metrics(redis_client, request_id, record, wait_seconds=0.5):
     """Join by the exact request ID; never use global Prometheus counter deltas."""
-    if redis_client is None:
+    if redis_client is None or not program_capture_enabled():
         return
     deadline = time.monotonic() + wait_seconds
     while True:

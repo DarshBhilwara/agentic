@@ -166,6 +166,17 @@ def _make_react_steps(evidence):
                        "llm_inference_time_ms": step.get("llm_inference_time_ms"),
                        "engine_metrics_status": step.get("engine_metrics_status"),
                        "tools": []})
+        for field in ("time_to_first_token_ms", "end_to_end_latency_ms", "scheduler_time_ms",
+                      "model_execute_time_ms", "model_forward_time_ms", "output_tokens",
+                      "output_tokens_per_second", "prefix_cached_tokens", "sequence_count",
+                      "measurement_source", "kv_measurement", "kv_measurement_reason",
+                      "kv_residency", "kv_memory_tier", "kv_eviction_cause",
+                      "kv_gpu_exclusive_blocks_at_finish", "kv_cpu_exclusive_blocks_at_finish",
+                      "kv_gpu_exclusive_peak_blocks", "kv_cpu_exclusive_peak_blocks",
+                      "kv_gpu_exclusive_block_ms", "kv_cpu_exclusive_block_ms",
+                      "kv_swap_out_exclusive_blocks", "kv_swap_in_exclusive_blocks", "kv_shared_blocks_observed",
+                      "kv_recompute_discarded_exclusive_blocks"):
+            joined[-1][field] = step.get(field)
         report_tools = step.get("tools", [])
         for tool in identity.get("tools", []):
             detail = next((item for item in report_tools if item.get("tool_index") == tool.get("index") and

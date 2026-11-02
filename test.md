@@ -1,5 +1,15 @@
 # One task with multiple ReAct steps
 
+The kernel retention and inference measurement update also requires fresh kernel
+collector images on both nodes, a fresh inference image, and worker/gateway images
+from the updated source. The worker-only recovery rollout below is insufficient
+for that update. Apply the updated collector settings while preserving live image
+references; source manifests still contain placeholder `:0.1` tags.
+Full retention uses `KERNEL_REDIS_MAX_EVENTS=0`, `KERNEL_REDIS_TTL=0`, and
+`KERNEL_ARCHIVE_MAX_BYTES=0`; Redis memory and archive disk use grow until managed.
+These settings cannot restore already trimmed records. Rebuild/rollout and runtime
+validation remain operator steps; no such operations were executed here.
+
 Run this sample yourself on **ryzen01 / agent-01** from
 `/home/agentic/agentic`. This guide covers only the fresh sample and its
 telemetry. No tests, sample tasks or deployment changes have been executed for
@@ -251,6 +261,135 @@ after terminal task status. Zero reported counters do not establish lossless
 capture. Worker scope describes the active container phase, not proven causality
 for every background syscall. Shared vLLM syscalls retain workload identity only.
 Engine timings overlap model wall time; unsupported KV measurements remain null.
+
+## 6. Compare end-to-end runtime with telemetry on and off
+
+The comparison runner submits the same small CSV task sequentially, once as a
+warmup and five measured repetitions per mode. The primary metric is
+`task_end_to_end_time_ms` from the gateway task record; it includes queue wait
+and synchronous ledger finalization before terminal publication. It also records
+the existing `task_completion_time_ms` and client-observed submission-to-terminal
+time as secondary metrics. The client timer includes polling (up to two seconds
+of quantization); the primary metric ends before final HSET transport and
+asynchronous export flushing. Fixture setup and independent host checks are
+outside task timing. Each successful task is independently checked;
+failed or incorrect runs are retained in the output but excluded from the mean.
+No failed run is silently replaced. The comparison is exploratory with five
+samples and may be affected by model/server load and output variation.
+
+This requires the updated telemetry toggle code deployed in worker, gateway,
+reaper, collector, and inference images. The implementation in this checkout is
+not evidence that those changes are live. The host snapshot must show the new
+mode flags on every workload and the same image/spec hashes apart from those
+flags. The on/off switch disables this platform's per-task instrumentation;
+Kubernetes, Redis, GPU, and host background monitoring remain active in both
+modes, so this measures the incremental task instrumentation cost.
+
+On **iiitd-desktop**, use the live image references already deployed and set
+only the experiment flags. Do not apply base manifests with placeholder image
+tags. Start with an empty queue, enable all task telemetry, and wait for rollouts:
+
+```sh
+kubectl -n agentic-ai exec deploy/redis -- redis-cli LLEN task_queue
+kubectl -n agentic-ai exec deploy/redis -- redis-cli LLEN task_processing
+
+kubectl -n agentic-ai set env deployment/api-gateway deployment/agent-worker deployment/task-reaper AGENT_PROGRAM_TELEMETRY_ENABLED=true AGENT_SEMANTIC_TELEMETRY_ENABLED=true
+kubectl -n agentic-ai set env deployment/agent-worker KERNEL_TELEMETRY_ENABLED=true
+kubectl -n agentic-ai set env daemonset/kernel-telemetry KERNEL_INFERENCE_SYSCALLS_ENABLED=true
+kubectl -n agentic-ai set env deployment/vllm AGENT_INFERENCE_TELEMETRY_ENABLED=true AGENT_INFERENCE_TRACING_ENABLED=true
+cd /home/iiitd/Documents/agentic
+kubectl -n agentic-ai patch deployment/vllm --type strategic --patch-file manifests/inference-telemetry-switch.patch.json
+
+kubectl -n agentic-ai set env deployment/api-gateway deployment/agent-worker deployment/task-reaper AGENT_TELEMETRY_ENABLED=true
+kubectl -n agentic-ai set env daemonset/kernel-telemetry KERNEL_CAPTURE_ENABLED=true
+
+kubectl -n agentic-ai rollout status deployment/api-gateway --timeout=180s
+kubectl -n agentic-ai rollout status deployment/agent-worker --timeout=180s
+kubectl -n agentic-ai rollout status deployment/task-reaper --timeout=180s
+kubectl -n agentic-ai rollout status deployment/vllm --timeout=180s
+kubectl -n agentic-ai rollout status daemonset/kernel-telemetry --timeout=300s
+kubectl -n agentic-ai get deploy,ds -o json > /tmp/telemetry-on-snapshot.json
+```
+
+Copy `/tmp/telemetry-on-snapshot.json` to the same path on **ryzen01** without exposing the
+credential. There, run one on batch:
+
+```sh
+cd /home/agentic/agentic
+COMPARISON_ROOT="$PWD/benchmark-results/telemetry-compare-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$COMPARISON_ROOT"
+
+python3 scripts/run_telemetry_comparison.py run \
+  --mode on \
+  --deployment-snapshot /tmp/telemetry-on-snapshot.json \
+  --workspace-root "$PWD/benchmark-workspaces" \
+  --output "$COMPARISON_ROOT/on" \
+  --repetitions 5 --warmups 1 --timeout 300 --max-steps 20
+```
+
+Wait until the batch finishes and both queues return to zero. On **iiitd-desktop**
+disable all task telemetry and wait for the same rollouts, then save and copy
+`/tmp/telemetry-off-snapshot.json` to the same path on ryzen01:
+
+```sh
+kubectl -n agentic-ai exec deploy/redis -- redis-cli LLEN task_queue
+kubectl -n agentic-ai exec deploy/redis -- redis-cli LLEN task_processing
+
+kubectl -n agentic-ai set env deployment/api-gateway deployment/agent-worker deployment/task-reaper AGENT_PROGRAM_TELEMETRY_ENABLED=true AGENT_SEMANTIC_TELEMETRY_ENABLED=true
+kubectl -n agentic-ai set env deployment/agent-worker KERNEL_TELEMETRY_ENABLED=true
+kubectl -n agentic-ai set env daemonset/kernel-telemetry KERNEL_INFERENCE_SYSCALLS_ENABLED=true
+kubectl -n agentic-ai set env deployment/api-gateway deployment/agent-worker deployment/task-reaper AGENT_TELEMETRY_ENABLED=false
+kubectl -n agentic-ai set env daemonset/kernel-telemetry KERNEL_CAPTURE_ENABLED=false
+kubectl -n agentic-ai set env deployment/vllm AGENT_INFERENCE_TELEMETRY_ENABLED=false AGENT_INFERENCE_TRACING_ENABLED=false
+
+kubectl -n agentic-ai rollout status deployment/api-gateway --timeout=180s
+kubectl -n agentic-ai rollout status deployment/agent-worker --timeout=180s
+kubectl -n agentic-ai rollout status deployment/task-reaper --timeout=180s
+kubectl -n agentic-ai rollout status deployment/vllm --timeout=180s
+kubectl -n agentic-ai rollout status daemonset/kernel-telemetry --timeout=300s
+kubectl -n agentic-ai get deploy,ds -o json > /tmp/telemetry-off-snapshot.json
+```
+
+On **ryzen01**, run the off batch with a separate output directory:
+
+```sh
+python3 scripts/run_telemetry_comparison.py run \
+  --mode off \
+  --deployment-snapshot /tmp/telemetry-off-snapshot.json \
+  --workspace-root "$PWD/benchmark-workspaces" \
+  --output "$COMPARISON_ROOT/off" \
+  --repetitions 5 --warmups 1 --timeout 300 --max-steps 20
+
+python3 scripts/run_telemetry_comparison.py compare \
+  --on "$COMPARISON_ROOT/on" \
+  --off "$COMPARISON_ROOT/off" \
+  --output "$COMPARISON_ROOT/comparison.json"
+cat "$COMPARISON_ROOT/comparison.json"
+```
+
+The report gives each mode's mean, median, sample standard deviation, and
+`(on mean - off mean) / off mean * 100`. It withholds the overhead estimate if
+either side has fewer than five independently verified successful runs or the
+deployment image/spec hashes differ. Keep all attempt workspaces and JSONL
+records, including failures.
+
+After both batches, wait for empty queues before restoring the usual on-mode
+settings. Keep the conditional vLLM startup command installed; its environment
+flag controls whether inference traces are emitted.
+
+```sh
+kubectl -n agentic-ai exec deploy/redis -- redis-cli LLEN task_queue
+kubectl -n agentic-ai exec deploy/redis -- redis-cli LLEN task_processing
+kubectl -n agentic-ai set env deployment/api-gateway deployment/agent-worker deployment/task-reaper AGENT_TELEMETRY_ENABLED=true AGENT_PROGRAM_TELEMETRY_ENABLED=true AGENT_SEMANTIC_TELEMETRY_ENABLED=true
+kubectl -n agentic-ai set env deployment/agent-worker KERNEL_TELEMETRY_ENABLED=true
+kubectl -n agentic-ai set env daemonset/kernel-telemetry KERNEL_CAPTURE_ENABLED=true KERNEL_INFERENCE_SYSCALLS_ENABLED=true
+kubectl -n agentic-ai set env deployment/vllm AGENT_INFERENCE_TELEMETRY_ENABLED=true AGENT_INFERENCE_TRACING_ENABLED=true
+kubectl -n agentic-ai rollout status deployment/api-gateway --timeout=180s
+kubectl -n agentic-ai rollout status deployment/agent-worker --timeout=180s
+kubectl -n agentic-ai rollout status deployment/task-reaper --timeout=180s
+kubectl -n agentic-ai rollout status deployment/vllm --timeout=180s
+kubectl -n agentic-ai rollout status daemonset/kernel-telemetry --timeout=300s
+```
 
 ## Next checkpoint
 

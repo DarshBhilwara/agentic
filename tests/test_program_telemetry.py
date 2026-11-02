@@ -341,6 +341,8 @@ def test_gateway_worker_program_export(backend, fake_model):
     assert exported["summary"]["task_wait_time_ms"] >= 1900
     assert exported["summary"]["task_completion_time_ms"] >= exported["summary"]["task_wait_time_ms"]
     assert exported["summary"]["instance_id"] == "case1"
+    task_record = client.get(f"/tasks/{submitted['task_id']}", headers={"X-API-Key": "alice-token"}).json()
+    assert float(task_record["task_end_to_end_time_ms"]) >= float(task_record["task_completion_time_ms"])
     assert len(exported["steps"]) == 2
     assert client.get(f"/telemetry/runs/{submitted['run_id']}", headers={"X-API-Key": "bob-token"}).status_code == 404
     assert r.ttl(f"telemetry:run:{submitted['run_id']}") > 0

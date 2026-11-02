@@ -12,6 +12,31 @@ from collection_policy import program_capture_enabled
 from kernel.collector import disabled_response
 
 
+def test_report_preserves_inference_measurements_without_payloads():
+    from console_api import _safe_steps, _safe_summary
+
+    steps = _safe_steps([{"step_index": 1, "time_to_first_token_ms": 12,
+                          "prefix_cached_tokens": 32, "model_forward_time_ms": 4,
+                          "measurement_source": "vllm-0.8.5-v0",
+                          "kv_measurement": "partial", "kv_measurement_reason": "shared blocks",
+                          "kv_gpu_exclusive_peak_blocks": 4, "kv_gpu_exclusive_block_ms": 12.5,
+                          "kv_swap_out_exclusive_blocks": 2, "kv_residency": "block_manager_observed",
+                          "prompt": "PRIVATE", "tools": []}])
+    assert steps[0]["time_to_first_token_ms"] == 12
+    assert steps[0]["prefix_cached_tokens"] == 32
+    assert steps[0]["model_forward_time_ms"] == 4
+    assert steps[0]["kv_measurement"] == "partial"
+    assert steps[0]["kv_gpu_exclusive_peak_blocks"] == 4
+    assert steps[0]["kv_gpu_exclusive_block_ms"] == 12.5
+    assert steps[0]["kv_swap_out_exclusive_blocks"] == 2
+    assert steps[0]["kv_residency"] == "block_manager_observed"
+    assert "PRIVATE" not in json.dumps(steps)
+    summary = _safe_summary({"total_prefix_cached_tokens": 32, "total_output_tokens": 5,
+                             "total_scheduler_time_ms": 2, "payload": "PRIVATE"})
+    assert summary == {"total_prefix_cached_tokens": 32, "total_output_tokens": 5,
+                       "total_scheduler_time_ms": 2}
+
+
 class FakeRedis:
     def lrange(self, *_args): return []
     def llen(self, *_args): return 0
@@ -88,6 +113,19 @@ def test_device_discovery_config_controls_gateway_env():
     gateway = next(d for d in yaml.safe_load_all(files["agent-node.yaml"]) if d and d.get("metadata", {}).get("name") == "api-gateway")
     env = {e["name"]: e.get("value") for e in gateway["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert env["CONSOLE_K8S_DISCOVERY"] == "true"
+
+
+def test_zero_kernel_retention_and_archive_size_render_no_expiry_or_rotation():
+    from console_api import validate_config
+
+    config = validate_config({"kernel_retention_days": 0, "archive_mb": 0})
+    files = {item["name"]: item["content"] for item in render_files(config)}
+    kernel = next(d for d in yaml.safe_load_all(files["kernel-telemetry.yaml"])
+                  if d and d.get("kind") == "DaemonSet")
+    env = {item["name"]: item.get("value")
+           for item in kernel["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["KERNEL_REDIS_TTL"] == "0"
+    assert env["KERNEL_ARCHIVE_MAX_BYTES"] == "0"
 
 
 def test_console_ownership_reports_and_offline_discovery(monkeypatch):

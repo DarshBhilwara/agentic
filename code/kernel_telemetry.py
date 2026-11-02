@@ -21,6 +21,7 @@ class KernelTelemetry:
     def __init__(self, path=None, *, required=None):
         self.path = path or os.getenv("KERNEL_TELEMETRY_SOCKET", "/run/agentic-kernel/collector.sock")
         self.required = (os.getenv("KERNEL_TELEMETRY_ENABLED", "false").lower() == "true"
+                         and os.getenv("AGENT_TELEMETRY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
                          if required is None else required)
         self._cgroup = None
         self._stack = []

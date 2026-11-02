@@ -53,6 +53,9 @@ def test_react_steps_join_request_and_call_ids_to_real_step_inventory(tmp_path):
     report = {"runs": [{"summary": {"inference_steps": 2, "total_prompt_tokens": 50},
         "steps": [{"step_index": 1, "step_time_ms": 10,
                    "llm_inference_time_ms": 8, "engine_metrics_status": "available",
+                   "time_to_first_token_ms": 3, "prefix_cached_tokens": 16,
+                   "kv_measurement": "partial", "model_forward_time_ms": 2,
+                   "kv_gpu_exclusive_peak_blocks": 4, "kv_swap_out_exclusive_blocks": 2,
                    "tools": [{"tool_index": 1, "tool_name": "execute_command",
                               "tool_ttf_ms": 3, "tool_latency_ms": 4}]}]}]}
     correlation = {"correlation": {"scope_counts": {"step:1": 12},
@@ -68,6 +71,12 @@ def test_react_steps_join_request_and_call_ids_to_real_step_inventory(tmp_path):
     assert steps[0]["kernel_scope_count"] == 12
     assert steps[0]["tools"][0]["tool_latency_ms"] == 4
     assert steps[0]["tools"][0]["tool_ttf_ms"] == 3
+    assert steps[0]["time_to_first_token_ms"] == 3
+    assert steps[0]["prefix_cached_tokens"] == 16
+    assert steps[0]["model_forward_time_ms"] == 2
+    assert steps[0]["kv_measurement"] == "partial"
+    assert steps[0]["kv_gpu_exclusive_peak_blocks"] == 4
+    assert steps[0]["kv_swap_out_exclusive_blocks"] == 2
     assert stats == {"inference_steps": 2, "total_prompt_tokens": 50}
     assert not sample.sample_is_valid(steps, True)
     valid_steps = steps + [

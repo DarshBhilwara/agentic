@@ -12,7 +12,6 @@ import requests
 
 
 TERMINAL = {"completed", "failed", "timeout", "cancelled"}
-MAX_KERNEL_RECORDS = 10000
 KERNEL_PAGE_SIZE = 500
 MAX_SEMANTIC_EVENTS = 1000
 COUNTERS = ("events", "perf_lost", "map_overflow", "queue_drops", "export_errors",
@@ -87,6 +86,8 @@ def correlate(records, run_id, program_id):
     entries, exits = defaultdict(list), []
     unpairable = 0
     unmatched = []
+    process_exit_unmatched = []
+    process_exit_keys = set()
     for index, record in enumerate(records):
         scopes[_scope(record)] += 1
         record_run, record_program = record.get("run_id"), record.get("program_id")
@@ -112,6 +113,15 @@ def correlate(records, run_id, program_id):
                               "run_id": record.get("run_id"), "program_id": record.get("program_id"),
                               "pid": record.get("pid"), "tid": record.get("tid"),
                               "syscall_id": record.get("syscall_id"), "ret": record.get("ret")})
+        elif record.get("type") == "process_exit_unmatched":
+            if all(value is not None for value in pair_key):
+                process_exit_keys.add(pair_key)
+            process_exit_unmatched.append({"scope": _scope(record), "step_index": record.get("step_index"),
+                              "tool_name": record.get("tool_name"), "tool_call_id": record.get("tool_call_id"),
+                              "run_id": record.get("run_id"), "program_id": record.get("program_id"),
+                              "pid": record.get("pid"), "tid": record.get("tid"),
+                              "syscall_id": record.get("syscall_id"),
+                              "entry_monotonic_ns": record.get("entry_monotonic_ns")})
     pairs = []
     paired_entries = set()
     paired_exits = set()
@@ -141,8 +151,12 @@ def correlate(records, run_id, program_id):
     if mismatched_program: warnings.append(f"{mismatched_program} kernel records have a different program identity")
     if program_id is None: warnings.append("selected program identity is unavailable from the report summary")
     if unmatched: warnings.append(f"{len(unmatched)} explicit unmatched_exit markers retained")
-    if len(paired_entries) < sum(map(len, entries.values())):
-        warnings.append("some syscall entries have no matching exit in the exported snapshot")
+    if process_exit_unmatched:
+        warnings.append(f"{len(process_exit_unmatched)} syscalls were in flight when their process exited")
+    unmatched_entries = [record for key, candidates in entries.items() if key not in process_exit_keys
+                         for index, record in candidates if index not in paired_entries]
+    if unmatched_entries:
+        warnings.append(f"{len(unmatched_entries)} syscall entries have no matching exit or process-exit disposition in the exported snapshot")
     if len(paired_exits) < len(exits):
         warnings.append("some syscall EXIT records have no matching entry in the exported snapshot")
     if unpairable:
@@ -159,7 +173,15 @@ def correlate(records, run_id, program_id):
                 "missing_run_id": missing_run, "missing_program_id": missing_program,
                 "mismatched_run_id": mismatched_run, "mismatched_program_id": mismatched_program},
             "matched_pair_count": len(pairs), "representative_pairs": list(by_scope.values()),
-            "unmatched_exits": unmatched, "warnings": warnings}
+            "unmatched_exits": unmatched, "process_exit_unmatched": process_exit_unmatched,
+            "unmatched_entries": [{"scope": _scope(record), "step_index": record.get("step_index"),
+                                   "tool_name": record.get("tool_name"), "tool_call_id": record.get("tool_call_id"),
+                                   "run_id": record.get("run_id"), "program_id": record.get("program_id"),
+                                   "pid": record.get("pid"), "tid": record.get("tid"),
+                                   "syscall_id": record.get("syscall_id"),
+                                   "entry_monotonic_ns": record.get("entry_monotonic_ns")}
+                                  for record in unmatched_entries],
+            "warnings": warnings}
 
 
 def _safe_recovery_policy(attributes):
@@ -222,7 +244,7 @@ def _owned_terminal_run(api, run_id):
             "events_truncated": len(data.get("events", [])) >= MAX_SEMANTIC_EVENTS}
 
 
-def export_run(api, run_id, output):
+def export_run(api, run_id, output, max_kernel_records=0):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     terminal = _owned_terminal_run(api, run_id)
@@ -235,8 +257,11 @@ def export_run(api, run_id, output):
     selected_program = (terminal["summary"].get("program_id") or terminal["run"].get("program_id") or report_program)
     first = _kernel_page(api, run_id, 0, KERNEL_PAGE_SIZE)
     initial_retained = first.get("retained")
-    records = list(first.get("records", []))[:MAX_KERNEL_RECORDS]
-    target = min(initial_retained, MAX_KERNEL_RECORDS) if isinstance(initial_retained, int) else MAX_KERNEL_RECORDS
+    cap = max_kernel_records if max_kernel_records > 0 else None
+    target = initial_retained if isinstance(initial_retained, int) else len(first.get("records", []))
+    if cap is not None:
+        target = min(target, cap)
+    records = list(first.get("records", []))[:target]
     while len(records) < target:
         page_limit = min(KERNEL_PAGE_SIZE, target - len(records))
         page = _kernel_page(api, run_id, len(records), page_limit)
@@ -262,9 +287,8 @@ def export_run(api, run_id, output):
                        isinstance(initial_retained, int) and not isinstance(initial_retained, bool) else None)
     if first.get("truncated") is True or (initial_trimmed is not None and initial_trimmed > 0):
         warnings.append("initial kernel snapshot is truncated; records beyond retention are unavailable")
-    if ((initial_retained is not None and initial_retained > MAX_KERNEL_RECORDS) or
-            (initial_retained is None and len(records) == MAX_KERNEL_RECORDS)):
-        warnings.append("export capped at the API retention maximum of 10,000 records")
+    if cap is not None and initial_retained is not None and initial_retained > cap:
+        warnings.append(f"export intentionally capped at {cap} records")
     correlation = correlate(records, run_id, selected_program)
     correlation["warnings"].extend(warnings)
     correlation["identity_inventory"] = {"run": terminal["run"], "summary": terminal["summary"],
@@ -323,16 +347,20 @@ def main():
     parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout in seconds, 1..60")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--max-kernel-records", type=int, default=0,
+                        help="maximum kernel records to export; 0 exports all retained records")
     args = parser.parse_args()
     if not 1 <= args.timeout <= 60:
         parser.error("timeout must be from 1 to 60 seconds")
+    if args.max_kernel_records < 0:
+        parser.error("max-kernel-records must be nonnegative")
     try:
         api = Gateway(args.gateway, read_token(args.token_file), args.timeout)
     except Exception as exc:
         parser.error(f"gateway setup failed ({safe_error(exc)})")
     output_was_absent = not args.output.exists()
     try:
-        result = export_run(api, args.run_id, args.output)
+        result = export_run(api, args.run_id, args.output, args.max_kernel_records)
     except Exception as exc:
         if output_was_absent and args.output.is_dir():
             try:

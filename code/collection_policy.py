@@ -12,12 +12,17 @@ def enabled(name, default=True):
     return os.getenv(name, "true" if default else "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def telemetry_enabled():
+    """Global task instrumentation gate; ownership and lifecycle stay enabled."""
+    return enabled("AGENT_TELEMETRY_ENABLED")
+
+
 def program_capture_enabled():
-    return enabled("AGENT_PROGRAM_TELEMETRY_ENABLED")
+    return telemetry_enabled() and enabled("AGENT_PROGRAM_TELEMETRY_ENABLED")
 
 
 def semantic_capture_enabled():
-    return enabled("AGENT_SEMANTIC_TELEMETRY_ENABLED")
+    return telemetry_enabled() and enabled("AGENT_SEMANTIC_TELEMETRY_ENABLED")
 
 
 def is_semantic_event(event_type):

@@ -144,9 +144,14 @@ def process_task(r, task_id):
                      payload={"result": safe_content(result), "error": safe_content(error)})
                 ledger.finish_run(run_id, legacy_status, task_status=status)
                 # Publish terminal task status after all telemetry is stored.
+                # Keep this mandatory timer in both telemetry modes. Unlike
+                # the program summary timer, it includes synchronous telemetry
+                # finalization above; asynchronous exporter flushing is excluded.
+                terminal_elapsed_ms = wait_ms + (time.perf_counter() - started) * 1000
                 r.hset(f"task:{task_id}", mapping={"status": legacy_status, "task_status": status,
                        "result": result, "error": error, "completed_at": now(),
-                       "task_completion_time_ms": elapsed_ms})
+                       "task_completion_time_ms": elapsed_ms,
+                       "task_end_to_end_time_ms": terminal_elapsed_ms})
                 r.zrem("task_deadlines", task_id)
 
 

@@ -29,7 +29,7 @@ Only non-secret configuration drafts are optionally saved in local storage.
 | View | Purpose |
 | --- | --- |
 | Overview | Three collection layers, draft switches, observed devices/runs, and connection state |
-| Collection | Layer/signal controls, capture policy, retention, archive limits, discovery interval, worker count, paths, and inference settings |
+| Collection | Layer/signal controls, capture policy, retention, archive limits, discovery interval, worker count, paths, and inference settings. Kernel retention days and archive size accept `0` for no expiry and no rotation. |
 | Devices | Kubernetes node readiness and scheduling capacity, pod/container states, and available collector heartbeats |
 | Runs | Search owned runs, inspect summaries, steps/tools, semantic events, and PID/TID-correlated syscalls |
 | Reports | Select owned runs and download bounded JSON, Markdown, or CSV snapshots |

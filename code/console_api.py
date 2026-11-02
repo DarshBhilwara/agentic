@@ -19,14 +19,14 @@ DEFAULTS = {
     "device_discovery_enabled": False,
     "inference_syscalls": True, "host_metrics": True, "traces_enabled": True,
     "metrics_enabled": True, "logs_enabled": True, "content_capture": "full",
-    "retention_days": 30, "max_events_per_run": 10000, "kernel_retention_days": 30,
-    "archive_mb": 64, "archive_files": 5, "discovery_seconds": 5,
+    "retention_days": 30, "max_events_per_run": 10000, "kernel_retention_days": 0,
+    "archive_mb": 0, "archive_files": 5, "discovery_seconds": 5,
     "worker_replicas": 2, "agent_root": "/home/agentic/agentic",
     "inference_cache": "/home/iiitd/Documents/agentic/model-cache", "model_name": "qwen",
     "vllm_url": "http://vllm-service:8000/v1",
 }
 INT_BOUNDS = {"retention_days": (1, 3650), "max_events_per_run": (1, 1_000_000),
-              "kernel_retention_days": (1, 3650), "archive_mb": (1, 1_048_576),
+              "kernel_retention_days": (0, 3650), "archive_mb": (0, 1_048_576),
               "archive_files": (1, 10000), "discovery_seconds": (1, 3600),
               "worker_replicas": (1, 100)}
 BOOLS = {k for k, v in DEFAULTS.items() if isinstance(v, bool)}
@@ -188,10 +188,25 @@ SUMMARY_FIELDS = {"task_status", "task_completion_time_ms", "task_wait_time_ms",
                   "tool_calls", "tool_failures", "total_llm_inference_time_ms", "total_tool_time_ms", "total_tool_ttf_ms",
                   "total_tool_wait_time_ms", "total_reasoning_time_ms", "total_prefill_time_ms", "total_decode_time_ms",
                   "total_inference_queue_time_ms", "total_prompt_tokens", "total_completion_tokens", "context_tokens",
-                  "peak_context_tokens", "kv_recomputed_tokens", "kv_retained_tokens", "kv_evicted_tokens", "kv_restored_tokens"}
+                  "peak_context_tokens", "kv_recomputed_tokens", "kv_retained_tokens", "kv_evicted_tokens", "kv_restored_tokens",
+                  "total_model_forward_time_ms", "total_model_execute_time_ms", "total_scheduler_time_ms", "total_time_to_first_token_ms",
+                  "total_end_to_end_latency_ms", "total_output_tokens", "total_prefix_cached_tokens",
+                  "total_kv_gpu_exclusive_block_ms", "total_kv_cpu_exclusive_block_ms",
+                  "total_kv_swap_out_exclusive_blocks", "total_kv_swap_in_exclusive_blocks",
+                  "total_kv_recompute_discarded_exclusive_blocks"}
 STEP_FIELDS = {"step_index", "step_status", "step_time_ms", "llm_inference_time_ms", "step_t_reasoning_ms",
                "step_t_acting_ms", "prefill_time_ms", "decode_time_ms", "inference_queue_time_ms", "context_tokens",
-               "prompt_tokens", "completion_tokens", "engine_metrics_status"}
+               "prompt_tokens", "completion_tokens", "engine_metrics_status",
+               "time_to_first_token_ms", "end_to_end_latency_ms", "scheduler_time_ms",
+               "model_execute_time_ms", "model_forward_time_ms", "output_tokens",
+               "output_tokens_per_second", "prefix_cached_tokens", "sequence_count",
+               "measurement_source", "kv_measurement", "kv_measurement_reason",
+               "kv_residency", "kv_memory_tier", "kv_eviction_cause",
+               "kv_gpu_exclusive_blocks_at_finish", "kv_cpu_exclusive_blocks_at_finish",
+               "kv_gpu_exclusive_peak_blocks", "kv_cpu_exclusive_peak_blocks",
+               "kv_gpu_exclusive_block_ms", "kv_cpu_exclusive_block_ms",
+               "kv_swap_out_exclusive_blocks", "kv_swap_in_exclusive_blocks", "kv_shared_blocks_observed",
+               "kv_recompute_discarded_exclusive_blocks"}
 TOOL_FIELDS = {"tool_status", "tool_ttf_ms", "tool_latency_ms", "tool_name", "tool_index"}
 EVENT_ATTRIBUTE_FIELDS = {"program_id", "step_index", "tool_name", "tool.name", "tool_status", "tool_latency_ms",
                          "tool_ttf_ms", "task_status", "status", "graph.node", "node", "previous_node", "action"}

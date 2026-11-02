@@ -58,8 +58,9 @@ spec:
         - {name: KERNEL_ARCHIVE, value: /var/log/agentic-kernel}
         - {name: KERNEL_CAPTURE_ENABLED, value: "true"}
         - {name: KERNEL_INFERENCE_SYSCALLS_ENABLED, value: "true"}
-        - {name: KERNEL_REDIS_TTL, value: "2592000"}
-        - {name: KERNEL_ARCHIVE_MAX_BYTES, value: "67108864"}
+        - {name: KERNEL_REDIS_MAX_EVENTS, value: "0"}
+        - {name: KERNEL_REDIS_TTL, value: "0"}
+        - {name: KERNEL_ARCHIVE_MAX_BYTES, value: "0"}
         - {name: KERNEL_ARCHIVE_FILES, value: "5"}
         - {name: KERNEL_DISCOVERY_INTERVAL_SECONDS, value: "5"}
         readinessProbe:

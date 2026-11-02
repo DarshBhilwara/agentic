@@ -68,6 +68,8 @@ def export_ledger_event(event, *, procedural_graph=None, summary=None):
     A standalone span per event avoids OpenTelemetry span-event count limits.
     Content values pass through the same capture policy used by other traces.
     """
+    if not telemetry_enabled():
+        return
     try:
         from collection_policy import is_semantic_event, semantic_capture_enabled
         if not semantic_capture_enabled() and is_semantic_event(event.get("type", "")):
@@ -118,6 +120,8 @@ def json_attribute(value):
 
 
 def set_error_status(current, description):
+    if not telemetry_enabled():
+        return
     try:
         from opentelemetry.trace import Status, StatusCode
         current.set_status(Status(StatusCode.ERROR, str(description)))
@@ -175,7 +179,46 @@ def graph_snapshot_json(graph):
     return json.dumps(protect(graph), default=str, separators=(",", ":"))
 
 
+from collection_policy import telemetry_enabled
+
+
+class _TelemetryDisabled(Exception):
+    pass
+
+
+class _NoopSpan:
+    def __enter__(self): return self
+    def __exit__(self, *_args): return False
+    def set_attribute(self, *_args): return None
+    def set_status(self, *_args): return None
+    def record_exception(self, *_args): return None
+    def add_event(self, *_args, **_kwargs): return None
+
+
+class _NoopTracer:
+    def start_as_current_span(self, *_args, **_kwargs): return _NoopSpan()
+
+
+class _NoopMetric:
+    def add(self, *_args, **_kwargs): return None
+    def record(self, *_args, **_kwargs): return None
+
+
+def _set_noop_telemetry():
+    global tracer, task_counter, task_error_counter, inference_counter, event_counter
+    global handoff_counter, program_duration, program_queue, program_steps
+    global inference_step_duration, tool_duration, tool_wait, tool_calls
+    global otel_context, propagate
+    tracer = _NoopTracer()
+    task_counter = task_error_counter = inference_counter = event_counter = _NoopMetric()
+    handoff_counter = program_duration = program_queue = program_steps = _NoopMetric()
+    inference_step_duration = tool_duration = tool_wait = tool_calls = _NoopMetric()
+    otel_context = propagate = None
+
+
 try:
+    if not telemetry_enabled():
+        raise _TelemetryDisabled()
     from opentelemetry import context as otel_context, propagate
     from opentelemetry import metrics, trace
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
@@ -244,32 +287,19 @@ try:
     tool_wait = meter.create_histogram("agent.tool.wait", unit="ms")
     tool_calls = meter.create_counter("agent.tool.calls.total")
 
+except _TelemetryDisabled:
+    _set_noop_telemetry()
 except Exception:
     logging.exception("OpenTelemetry initialization failed; telemetry is disabled")
-    class _NoopSpan:
-        def __enter__(self): return self
-        def __exit__(self, *_args): return False
-        def set_attribute(self, *_args): return None
-        def set_status(self, *_args): return None
-        def record_exception(self, *_args): return None
-        def add_event(self, *_args, **_kwargs): return None
-
-    class _NoopTracer:
-        def start_as_current_span(self, *_args, **_kwargs): return _NoopSpan()
-
-    class _NoopMetric:
-        def add(self, *_args, **_kwargs): return None
-        def record(self, *_args, **_kwargs): return None
-
-    tracer = _NoopTracer()
-    task_counter = task_error_counter = inference_counter = event_counter = handoff_counter = _NoopMetric()
-    program_duration = program_queue = program_steps = inference_step_duration = tool_duration = tool_wait = tool_calls = _NoopMetric()
-    otel_context = propagate = None
+    _set_noop_telemetry()
 
 
 @contextmanager
 def span(name, *, context=None, **attributes):
     from collection_policy import detailed_capture_enabled, program_capture_enabled, semantic_capture_enabled
+    if not telemetry_enabled():
+        yield _SuppressedSpan()
+        return
     if not detailed_capture_enabled() and name not in {"agent.task.submit", "agent.task.get"}:
         yield _SuppressedSpan()
         return
