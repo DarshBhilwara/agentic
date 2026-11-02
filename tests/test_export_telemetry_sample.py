@@ -126,6 +126,23 @@ def test_export_terminal_run_pages_kernel_and_correlates_across_page_boundary(tm
     assert "prompt" not in (output / "report.json").read_text()
 
 
+@pytest.mark.parametrize("source", ["node_health", "status"])
+def test_export_warns_about_cumulative_node_losses_without_attribution(tmp_path, source):
+    class LossApi(ExportApi):
+        def request(self, method, path, **kwargs):
+            result = super().request(method, path, **kwargs)
+            if method == "GET" and path.endswith("/kernel"):
+                result["node_health"]["queue_drops"] = "0"
+                result[source]["queue_drops"] = "17"
+            return result
+
+    output = tmp_path / "export"
+    inspect.export_run(LossApi(), "run-1", output)
+    correlation = json.loads((output / "correlation.json").read_text())
+    assert any(source in warning and "17 cumulative queue_drops" in warning and "not attributed" in warning
+               for warning in correlation["kernel"]["warnings"])
+
+
 def test_export_rejects_nonterminal_run_before_privacy_report(tmp_path):
     api = ExportApi(status="running")
     with pytest.raises(ValueError, match="must be terminal"):

@@ -75,7 +75,8 @@ def _canonical(resource):
     annotations.pop("kubectl.kubernetes.io/restartedAt", None)
     template.get("metadata", {})["annotations"] = annotations
     flags = set(MODE_FLAGS.values())
-    for container in template.get("spec", {}).get("containers", []):
+    pod_spec = template.get("spec", {})
+    for container in [*pod_spec.get("containers", []), *pod_spec.get("initContainers", [])]:
         container["env"] = sorted((entry for entry in container.get("env", [])
                                    if entry.get("name") not in flags),
                                   key=lambda entry: entry.get("name", ""))
@@ -141,6 +142,9 @@ def snapshot_metadata(path, mode):
     inference_container = _container(resources["inference"][0], "vllm")
     if inference_container.get("command") != ["sh", "-c"] or inference_container.get("args") != expected_args:
         raise ValueError("vLLM must use the conditional tracing startup patch before either batch")
+    probe = inference_container.get("readinessProbe", {}).get("httpGet", {})
+    if probe.get("path") != "/health" or probe.get("port") != 8000:
+        raise ValueError("vLLM requires the /health readiness probe on port 8000 before either batch")
     if expected:
         for role in ("worker", "gateway", "reaper"):
             for signal in ("TRACES", "METRICS", "LOGS"):
@@ -237,13 +241,27 @@ def run_mode(args):
             row["task_end_to_end_time_ms"] = _number(task.get("task_end_to_end_time_ms"))
             row["task_completion_time_ms"] = _number(task.get("task_completion_time_ms"))
             row["client_submit_to_terminal_ms"] = (time.monotonic() - submitted_at) * 1000
+            # Preserve terminal diagnostics outside the measured task boundary.
+            _write(output / ("task-%02d.json" % (index + 1)), {
+                key: task.get(key) for key in ("id", "task_id", "run_id", "status", "task_status",
+                    "error", "task_end_to_end_time_ms", "task_completion_time_ms")})
             row["stage"] = "verification"
             verification = _host_verify(workspace) if row["task_status"] == "Success" else {
                 "passed": False, "skipped_reason": "runtime_task_not_successful", "commands": []}
+            _write(output / ("verification-%02d.json" % (index + 1)), verification)
             row["verification"] = {"passed": verification.get("passed", False),
                                    "checks": [{"name": item.get("name"), "returncode": item.get("returncode"),
                                                "passed": item.get("passed")}
                                               for item in verification.get("commands", [])]}
+            row["exclusion_reasons"] = []
+            if warmup:
+                row["exclusion_reasons"].append("warmup")
+            if row["task_status"] != "Success":
+                row["exclusion_reasons"].append("runtime_not_successful")
+            if verification.get("passed") is not True:
+                row["exclusion_reasons"].append("independent_verification_failed")
+            if row["task_end_to_end_time_ms"] is None:
+                row["exclusion_reasons"].append("missing_primary_timing")
             if args.mode == "on":
                 try:
                     evidence = output / ("evidence-%02d" % (index + 1))
@@ -273,6 +291,8 @@ def run_mode(args):
                                              for key, count in scopes.items()))}
                 except Exception as exc:
                     row["telemetry_export_error"] = safe_error(exc)
+                if row.get("telemetry_capture_check", {}).get("captured") is not True:
+                    row["exclusion_reasons"].append("telemetry_capture_unverified")
             row["eligible"] = bool(not warmup and row["task_status"] == "Success" and
                                     verification.get("passed") is True and
                                     row["task_end_to_end_time_ms"] is not None and

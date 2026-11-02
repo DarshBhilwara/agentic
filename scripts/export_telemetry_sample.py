@@ -287,6 +287,24 @@ def export_run(api, run_id, output, max_kernel_records=0):
                        isinstance(initial_retained, int) and not isinstance(initial_retained, bool) else None)
     if first.get("truncated") is True or (initial_trimmed is not None and initial_trimmed > 0):
         warnings.append("initial kernel snapshot is truncated; records beyond retention are unavailable")
+    # Retention describes stored records, not capture completeness. These are
+    # cumulative node/collector counters, so surface them without attributing
+    # the counts to this run.
+    for label, snapshot in (("initial", first), ("final", final)):
+        # A new collector's healthy heartbeat must not hide the old capture's
+        # retained counters after a restart.
+        for source in ("node_health", "status"):
+            status = snapshot.get(source) or {}
+            for counter in ("perf_lost", "map_overflow", "queue_drops", "export_errors",
+                            "identity_misses", "discovery_errors"):
+                try:
+                    count = int(status.get(counter, 0))
+                except (TypeError, ValueError):
+                    continue
+                if count > 0:
+                    warnings.append(
+                        f"{label} {source} reports {count} cumulative {counter}; "
+                        "this count is not attributed to the selected run")
     if cap is not None and initial_retained is not None and initial_retained > cap:
         warnings.append(f"export intentionally capped at {cap} records")
     correlation = correlate(records, run_id, selected_program)

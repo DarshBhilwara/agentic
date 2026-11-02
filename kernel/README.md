@@ -94,6 +94,7 @@ Node archives survive pod replacement, but not loss of the node's disk.
 | `KERNEL_REDIS_TTL` | 0 (no expiry) |
 | `KERNEL_REDIS_MAX_EVENTS` | `0`: retain all records until TTL; positive value keeps the newest N |
 | Userspace queue | 16,384 records |
+| `KERNEL_WRITER_BATCH_SIZE` | 128 queued records per archive write / Redis pipeline |
 | In-flight syscall map | 65,536 entries |
 | `KERNEL_DISCOVERY_INTERVAL_SECONDS` | 5 |
 | `KERNEL_IDENTITY_TTL_SECONDS` | 3,600 for inactive identities |
@@ -105,7 +106,10 @@ without a bound until an operator intervenes; capacity planning and external
 monitoring are required. Setting `KERNEL_REDIS_TTL` to a positive value expires
 Redis records after that many seconds. Setting `KERNEL_ARCHIVE_MAX_BYTES` to a
 positive value enables size/count rotation; archives can exceed the size limit
-by one record. The userspace queue, BPF maps, perf buffers, outages, and node
+by one writer batch. The writer drains only immediately available records, so
+batching adds no deliberate fill delay. It reduces file-open and Redis round
+trips while keeping the queue bounded; it does not guarantee zero drops.
+The userspace queue, BPF maps, perf buffers, outages, and node
 disk failures can still cause missing records, so this configuration prevents
 automatic retention trimming but does not promise lossless capture.
 The socket, raw archives, and Redis are intended for trusted research workloads.

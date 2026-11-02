@@ -1,10 +1,12 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import run_telemetry_comparison as comparison
 
 
@@ -91,21 +93,39 @@ def _snapshot(tmp_path):
     return path, items
 
 
-@pytest.mark.parametrize("defect", ["program_off", "missing_exporter", "old_startup"])
+@pytest.mark.parametrize("defect", ["program_off", "missing_exporter", "old_startup", "missing_readiness"])
 def test_snapshot_rejects_incomplete_on_configuration(tmp_path, defect):
     path, items = _snapshot(tmp_path)
     assert comparison.snapshot_metadata(path, "on")["mode"] == "on"
-    target = "vllm" if defect == "old_startup" else "agent-worker"
+    target = "vllm" if defect in {"old_startup", "missing_readiness"} else "agent-worker"
     item = next(item for item in items if item["metadata"]["name"] == target)
     container = item["spec"]["template"]["spec"]["containers"][0]
     if defect == "old_startup":
         container["args"] = ["exec python3 -m vllm.entrypoints.openai.api_server --collect-detailed-traces all"]
+    elif defect == "missing_readiness":
+        container.pop("readinessProbe")
     else:
         flag = "AGENT_PROGRAM_TELEMETRY_ENABLED" if defect == "program_off" else "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
         next(entry for entry in container["env"] if entry["name"] == flag)["value"] = "false" if defect == "program_off" else ""
     path.write_text(json.dumps({"items": items}))
     with pytest.raises(ValueError):
         comparison.snapshot_metadata(path, "on")
+
+
+def test_comparable_config_normalizes_init_mode_but_keeps_other_drift(tmp_path):
+    path, items = _snapshot(tmp_path)
+    worker = next(item for item in items if item["metadata"]["name"] == "agent-worker")
+    init = worker["spec"]["template"]["spec"]["initContainers"][0]
+    init["env"] = [{"name": "AGENT_TELEMETRY_ENABLED", "value": "true"},
+                   {"name": "KEEP_SETTING", "value": "original"}]
+    original = comparison._canonical(worker)
+    init["env"][0]["value"] = "false"
+    assert comparison._canonical(worker) == original
+    init["env"][1]["value"] = "changed"
+    assert comparison._canonical(worker) != original
+    init["env"][1]["value"] = "original"
+    init["image"] = "different-image"
+    assert comparison._canonical(worker) != original
 
 
 def test_inference_startup_patch_matches_source_manifest():

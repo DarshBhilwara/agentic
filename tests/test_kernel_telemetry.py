@@ -314,6 +314,69 @@ def test_redis_export_can_retain_all_records_without_expiry(monkeypatch):
     assert any(call[:2] == ("persist", "kernel:run:r2:status") for call in client.pipe.calls)
 
 
+def test_redis_batch_export_uses_one_pipeline_and_preserves_order(monkeypatch):
+    class Pipeline:
+        def __init__(self): self.calls = []
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: self.calls.append((name, *args, kwargs))
+        def execute(self): return self.calls
+    class FakeRedis:
+        def __init__(self): self.pipelines = []
+        def pipeline(self):
+            pipe = Pipeline()
+            self.pipelines.append(pipe)
+            return pipe
+
+    client = FakeRedis()
+    monkeypatch.setattr(collector, "REDIS_TTL", 0)
+    values = [{"run_id": "r1", "sequence": i} for i in range(3)]
+    collector.export_run_events(client, values)
+    assert len(client.pipelines) == 1
+    appended = [call[2] for call in client.pipelines[0].calls if call[0] == "rpush"]
+    assert [json.loads(item)["sequence"] for item in appended] == [0, 1, 2]
+
+
+def test_writer_batches_without_reordering_registration(monkeypatch, tmp_path):
+    import queue
+    import sys
+    from collections import deque
+
+    values = deque([{"run_id": "r1", "n": 1}, {"run_id": "r1", "n": 2},
+                    {"_status_only": True, "run_id": "r2"}, {"run_id": "r2", "n": 3}])
+
+    class InputQueue:
+        def get(self):
+            if not values:
+                raise KeyboardInterrupt("end of test stream")
+            return values.popleft()
+
+        def get_nowait(self):
+            if not values:
+                raise queue.Empty
+            return values.popleft()
+
+    operations = []
+    monkeypatch.setitem(sys.modules, "redis", SimpleNamespace(
+        Redis=SimpleNamespace(from_url=lambda *args, **kwargs: object())))
+    monkeypatch.setattr(collector, "EVENTS", InputQueue())
+    monkeypatch.setattr(collector, "ROOT", str(tmp_path))
+    monkeypatch.setattr(collector, "NODE", "test-node")
+    monkeypatch.setattr(collector, "WRITER_BATCH_SIZE", 2)
+    monkeypatch.setattr(collector, "MAX_BYTES", 0)
+    monkeypatch.setattr(collector, "COUNTS", dict.fromkeys(collector.COUNTS, 0))
+    monkeypatch.setattr(collector, "export_run_events", lambda client, batch:
+                        operations.append([value["n"] for value in batch]))
+    monkeypatch.setattr(collector, "mark_run_active", lambda client, run:
+                        operations.append(run))
+    with pytest.raises(KeyboardInterrupt):
+        collector.writer()
+    assert operations == [[1, 2], "r2", [3]]
+    records = [json.loads(line) for line in (tmp_path / "test-node.jsonl").read_text().splitlines()]
+    assert [record["n"] for record in records] == [1, 2, 3]
+    assert collector.COUNTS["events"] == 3
+    assert collector.COUNTS["export_errors"] == 0
+
+
 def test_zero_archive_limit_disables_rotation(monkeypatch, tmp_path):
     monkeypatch.setattr(collector, "MAX_BYTES", 0)
     archive = tmp_path / "node.jsonl"

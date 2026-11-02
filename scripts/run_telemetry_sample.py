@@ -96,19 +96,28 @@ def _host_verify(workspace):
         original_report = None
         original_report_exists = False
         report_valid = False
+    outcomes.append({"name": "agent_report_exists", "passed": original_report_exists})
+    outcomes.append({"name": "agent_report_valid", "passed": report_valid})
 
     def run(label, argv):
         try:
             result, timed_out = _run_process_group(argv, workspace, 30)
             outcomes.append({"name": label, "returncode": result.returncode,
                              "timed_out": timed_out, "stdout": result.stdout[-4000:],
-                             "stderr": result.stderr[-2000:]})
-            return result
+                             "stderr": result.stderr[-2000:],
+                             "passed": not timed_out and result.returncode == 0})
+            return None if timed_out else result
         except Exception as exc:
-            outcomes.append({"name": label, "error": safe_error(exc)})
+            outcomes.append({"name": label, "error": safe_error(exc), "passed": False})
             return None
 
-    tests = run("unit_tests", [sys.executable, "-m", "unittest", "-v", "test_analyze"])
+    # Grade with the original tests, even if the agent edited test_analyze.py.
+    # __file__ still resolves the analyzer in the task workspace; no task file
+    # is rewritten and unittest receives only its own arguments.
+    tests = run("unit_tests", [sys.executable, "-c",
+        "import sys; source=sys.argv[1]; filename=sys.argv[2]; sys.argv=['test_analyze','-v']; "
+        "__file__=filename; exec(compile(source,filename,'exec'))",
+        SEED_TESTS, str(workspace / "test_analyze.py")])
     csv_check = run("original_dataset", [sys.executable, "-c",
         "from pathlib import Path; import sys; expected=sys.argv[1]; actual=Path('sales.csv').read_text(); sys.exit(0 if actual == expected else 1)", DATA])
     good = tests is not None and tests.returncode == 0 and csv_check is not None and csv_check.returncode == 0
@@ -120,11 +129,12 @@ def _host_verify(workspace):
         filtered = run("north_cli_check", [sys.executable, "analyze.py", "sales.csv", "--region", "North",
                                              "--output", str(north_output)])
         try:
-            good = good and filtered is not None and filtered.returncode == 0
-            good = good and json.loads(north_output.read_text()) == {
+            filtered_passed = filtered is not None and filtered.returncode == 0 and json.loads(north_output.read_text()) == {
                 "count": 2, "total": 150, "average": 75, "totals_by_region": {"North": 150}}
         except Exception:
-            good = False
+            filtered_passed = False
+        outcomes[-1]["passed"] = bool(filtered_passed)
+        good = good and filtered_passed
         for name, body, expected, should_pass in (
             ("refund_decimal", "region,amount\nA,1.5\nA,-0.25\nB,2.0\n", {"count":3,"total":3.25,"average":3.25/3,"totals_by_region":{"A":1.25,"B":2.0}}, True),
             ("empty_input", "region,amount\n", {"count":0,"total":0,"average":None,"totals_by_region":{}}, True),
@@ -139,6 +149,7 @@ def _host_verify(workspace):
                     passed = json.loads(result.stdout) == expected
                 except Exception:
                     passed = False
+            outcomes[-1]["passed"] = passed
             good = good and passed
     try:
         report_unchanged = original_report_exists and report_path.read_bytes() == original_report
@@ -146,7 +157,8 @@ def _host_verify(workspace):
         report_unchanged = False
     good = good and report_unchanged
     outcomes.append({"name": "agent_report_preserved", "passed": report_unchanged})
-    return {"passed": bool(good), "commands": outcomes}
+    return {"passed": bool(good), "commands": outcomes,
+            "failure_reasons": [item["name"] for item in outcomes if item.get("passed") is False]}
 
 
 def _make_react_steps(evidence):
@@ -280,7 +292,10 @@ def run(args):
         return 2
     _write_json(output / "task.json", {"task_id": submitted.get("task_id"), "run_id": submitted.get("run_id"),
                                         "program_id": submitted.get("program_id"),
-                                        "status": task.get("status"), "task_status": task.get("task_status")})
+                                        "status": task.get("status"), "task_status": task.get("task_status"),
+                                        "error": task.get("error"),
+                                        "task_end_to_end_time_ms": task.get("task_end_to_end_time_ms"),
+                                        "task_completion_time_ms": task.get("task_completion_time_ms")})
     evidence = output / "evidence"
     stage = "export"
     try:

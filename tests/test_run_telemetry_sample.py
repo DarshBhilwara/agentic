@@ -107,6 +107,34 @@ def test_timeout_skips_host_verification():
     assert result == {"passed": False, "skipped_reason": "runtime_task_not_successful", "commands": []}
 
 
+@pytest.mark.parametrize("report", [None, "not json", '{"average":0}'])
+def test_missing_or_invalid_agent_report_has_explicit_failure(tmp_path, report):
+    (tmp_path / "analyze.py").write_text(sample.SEED_ANALYZER.replace("total // len(rows)", "total / len(rows)"))
+    (tmp_path / "sales.csv").write_text(sample.DATA)
+    # Agent-owned tests must not determine the independent grading outcome.
+    (tmp_path / "test_analyze.py").write_text("raise RuntimeError('modified tests')")
+    if report is not None:
+        (tmp_path / "report.json").write_text(report)
+    result = sample._host_verify(tmp_path)
+    assert not result["passed"]
+    assert "agent_report_valid" in result["failure_reasons"]
+    assert next(check for check in result["commands"] if check["name"] == "unit_tests")["passed"]
+    assert ("agent_report_exists" in result["failure_reasons"]) == (report is None)
+
+
+def test_independent_grading_uses_original_tests_and_preserves_workspace(tmp_path):
+    (tmp_path / "analyze.py").write_text(sample.SEED_ANALYZER.replace("total // len(rows)", "total / len(rows)"))
+    (tmp_path / "sales.csv").write_text(sample.DATA)
+    (tmp_path / "test_analyze.py").write_text("raise RuntimeError('modified tests')")
+    report = '{"count":2,"total":150,"average":75,"totals_by_region":{"North":150}}'
+    (tmp_path / "report.json").write_text(report)
+    result = sample._host_verify(tmp_path)
+    assert result["passed"]
+    assert result["failure_reasons"] == []
+    assert (tmp_path / "report.json").read_text() == report
+    assert (tmp_path / "test_analyze.py").read_text() == "raise RuntimeError('modified tests')"
+
+
 @pytest.mark.parametrize("mutate_report", [False, True])
 def test_host_verification_checks_agent_report_unchanged(tmp_path, monkeypatch, mutate_report):
     report_path = tmp_path / "report.json"

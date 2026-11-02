@@ -264,6 +264,24 @@ Engine timings overlap model wall time; unsupported KV measurements remain null.
 
 ## 6. Compare end-to-end runtime with telemetry on and off
 
+The comparison normalizes only the experiment mode flags in both regular and
+init containers. Other init-container settings remain part of the configuration
+hash. Earlier reports produced before this normalization fix remain historical
+evidence; do not overwrite them or combine attempts across batches.
+
+Each attempt now saves `task-NN.json` (terminal status, error, and timers) and
+`verification-NN.json` (bounded command output, individual pass/fail checks, and
+failure reasons). These files are saved after the captured task time. Independent
+grading uses the original fixture tests rather than trusting an agent-edited
+test file. Missing, invalid, and changed reports are separate checks; none is
+silently repaired by grading. Runtime Success still does not establish correctness.
+
+Kernel exports warn about nonzero cumulative collector loss counters; these are
+not exact per-run loss counts. The bounded batch writer reduces per-record file
+opens and Redis round trips, but deployment and hardware validation are still
+required before making capture-completeness or performance claims. Do not keep
+repeating batches solely to obtain five favourable outcomes.
+
 Before either batch, install the inference readiness gate on iiitd-desktop:
 
 ```sh

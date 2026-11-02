@@ -40,6 +40,7 @@ IDENTITY_TTL_NS = int(os.getenv("KERNEL_IDENTITY_TTL_SECONDS", "3600")) * 1_000_
 IDENTITY_LIMIT = int(os.getenv("KERNEL_IDENTITY_LIMIT", "65536"))
 REDIS_MAX_EVENTS = int(os.getenv("KERNEL_REDIS_MAX_EVENTS", "0"))
 REDIS_TTL = int(os.getenv("KERNEL_REDIS_TTL", "2592000"))
+WRITER_BATCH_SIZE = max(1, int(os.getenv("KERNEL_WRITER_BATCH_SIZE", "128")))
 
 PROGRAM = r"""
 #include <uapi/linux/ptrace.h>
@@ -307,26 +308,31 @@ def rotate_archive(path):
 
 
 def export_run_event(client, value):
-    run = value.get("run_id")
-    if not run:
-        return
-    key = f"kernel:run:{run}"
+    export_run_events(client, [value])
+
+
+def export_run_events(client, values):
     pipe = client.pipeline()
-    pipe.rpush(key, json.dumps(value, separators=(",", ":")))
-    if REDIS_MAX_EVENTS > 0:
-        pipe.ltrim(key, -REDIS_MAX_EVENTS, -1)
-    if REDIS_TTL > 0:
-        pipe.expire(key, REDIS_TTL)
-    else:
-        pipe.persist(key)
-    pipe.hincrby(f"{key}:status", "events", 1)
-    pipe.hset(f"{key}:status", "node", NODE)
-    pipe.hset(f"{key}:status", mapping={name: COUNTS[name] for name in
-             ("perf_lost", "map_overflow", "queue_drops", "export_errors", "identity_misses")})
-    if REDIS_TTL > 0:
-        pipe.expire(f"{key}:status", REDIS_TTL)
-    else:
-        pipe.persist(f"{key}:status")
+    for value in values:
+        run = value.get("run_id")
+        if not run:
+            continue
+        key = f"kernel:run:{run}"
+        pipe.rpush(key, json.dumps(value, separators=(",", ":")))
+        if REDIS_MAX_EVENTS > 0:
+            pipe.ltrim(key, -REDIS_MAX_EVENTS, -1)
+        if REDIS_TTL > 0:
+            pipe.expire(key, REDIS_TTL)
+        else:
+            pipe.persist(key)
+        pipe.hincrby(f"{key}:status", "events", 1)
+        pipe.hset(f"{key}:status", "node", NODE)
+        pipe.hset(f"{key}:status", mapping={name: COUNTS[name] for name in
+                 ("perf_lost", "map_overflow", "queue_drops", "export_errors", "identity_misses")})
+        if REDIS_TTL > 0:
+            pipe.expire(f"{key}:status", REDIS_TTL)
+        else:
+            pipe.persist(f"{key}:status")
     pipe.execute()
 
 
@@ -347,19 +353,32 @@ def writer():
     os.makedirs(ROOT, exist_ok=True)
     client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis-service:6379/0"), socket_timeout=2)
     path = os.path.join(ROOT, f"{NODE}.jsonl")
+    pending = None
     while True:
-        value = EVENTS.get()
+        value = pending if pending is not None else EVENTS.get()
+        pending = None
+        batch = [value]
         try:
             if value.get("_status_only"):
                 mark_run_active(client, value["run_id"])
                 continue
+            while len(batch) < WRITER_BATCH_SIZE:
+                try:
+                    following = EVENTS.get_nowait()
+                except queue.Empty:
+                    break
+                if following.get("_status_only"):
+                    pending = following
+                    break
+                batch.append(following)
             rotate_archive(path)
             with open(path, "a", encoding="utf-8") as stream:
-                stream.write(json.dumps(value, separators=(",", ":")) + "\n")
-            export_run_event(client, value)
-            COUNTS["events"] += 1
+                stream.writelines(json.dumps(item, separators=(",", ":")) + "\n"
+                                  for item in batch)
+            export_run_events(client, batch)
+            COUNTS["events"] += len(batch)
         except Exception:
-            COUNTS["export_errors"] += 1
+            COUNTS["export_errors"] += len(batch)
 
 
 def health_writer():
