@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and compare five sequential coding tasks with telemetry on or off.
+"""Run five-task telemetry batches or plan a balanced fifty-per-mode experiment.
 
 Run each mode on the agent host after applying that mode and saving a fresh
 read-only Kubernetes snapshot. The script never changes cluster state.
@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import statistics
 import sys
 import time
@@ -211,7 +212,64 @@ def _verify_attempt(workspace, task_status, policy):
         return {"passed": False, "diagnostic_error": safe_error(exc), "commands": []}
 
 
+def _block_schedule():
+    return [{"batch": 2 * block + position + 1, "block": block + 1, "mode": mode,
+             "directory": "block-%02d/%s" % (block + 1, mode)}
+            for block in range(10)
+            for position, mode in enumerate(("on", "off") if block % 2 == 0 else ("off", "on"))]
+
+
+def plan_blocks(args):
+    root = args.output.expanduser().resolve()
+    root.relative_to((Path(__file__).resolve().parents[1] / "benchmark-results").resolve())
+    root.mkdir(parents=True, exist_ok=False)
+    plan = {"version": 1, "created_unix": time.time(), "repetitions": 5, "warmups": 1,
+            "eligibility": "runtime", "timeout_seconds": 300, "max_steps": 20,
+            "workload_sha256": _workload_sha256(), "schedule": _block_schedule()}
+    _write(root / "plan.json", plan)
+    print(json.dumps(plan, indent=2))
+    return 0
+
+
+def _read_block_plan(path):
+    path = Path(path).expanduser().resolve()
+    plan = json.loads(path.read_text())
+    expected = {"version": 1, "repetitions": 5, "warmups": 1, "eligibility": "runtime",
+                "timeout_seconds": 300, "max_steps": 20, "schedule": _block_schedule()}
+    if any(plan.get(key) != value for key, value in expected.items()):
+        raise ValueError("unsupported or altered block plan")
+    digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return path.parent, plan, digest
+
+
+def _planned_batch(args):
+    if not getattr(args, "plan", None):
+        if getattr(args, "batch", None) is not None:
+            raise ValueError("--batch requires --plan")
+        return {}
+    root, plan, digest = _read_block_plan(args.plan)
+    if args.batch is None or not 1 <= args.batch <= 20:
+        raise ValueError("--plan requires --batch 1..20")
+    item = plan["schedule"][args.batch - 1]
+    if (args.mode != item["mode"] or args.output.expanduser().resolve() != root / item["directory"]
+            or args.repetitions != 5 or args.warmups != 1 or args.eligibility != "runtime"
+            or args.timeout != 300 or args.max_steps != 20
+            or plan["workload_sha256"] != _workload_sha256()):
+        raise ValueError("run arguments/workload do not match the planned batch")
+    if args.batch > 1:
+        previous = root / plan["schedule"][args.batch - 2]["directory"]
+        metadata = json.loads((previous / "experiment.json").read_text())
+        if (metadata.get("plan_sha256") != digest or metadata.get("plan_batch") != args.batch - 1
+                or not metadata.get("completed_unix")):
+            raise ValueError("previous planned batch is not complete")
+        rows = [json.loads(line) for line in (previous / "results.jsonl").read_text().splitlines() if line]
+        if len(rows) != 6 or any(row.get("stage") != "complete" for row in rows):
+            raise ValueError("previous batch has an incomplete/uncertain attempt; inspect IDs before continuing")
+    return {"plan_sha256": digest, "plan_batch": args.batch, "plan_block": item["block"]}
+
+
 def run_mode(args):
+    planned = _planned_batch(args)
     config = snapshot_metadata(args.deployment_snapshot, args.mode)
     output = args.output.expanduser().resolve()
     root = Path(__file__).resolve().parents[1] / "benchmark-results"
@@ -223,7 +281,8 @@ def run_mode(args):
     workspace_root = args.workspace_root.expanduser().resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
     api = Gateway(args.gateway, read_token(args.token_file), 30)
-    metadata = {"mode": args.mode, "repetitions": args.repetitions, "warmups": args.warmups,
+    metadata = {**planned, "started_unix": time.time(),
+                "mode": args.mode, "repetitions": args.repetitions, "warmups": args.warmups,
                 "timeout_seconds": args.timeout, "max_steps": args.max_steps,
                 "deployment": config, "workload_sha256": _workload_sha256(),
                 "measurement": {"primary": "worker task_end_to_end_time_ms, includes queue wait and synchronous ledger finalization",
@@ -343,6 +402,8 @@ def run_mode(args):
                "median_ms": statistics.median(eligible) if eligible else None,
                "stdev_ms": statistics.stdev(eligible) if len(eligible) >= 2 else None}
     _write(output / "summary.json", summary)
+    metadata["completed_unix"] = time.time()
+    _write(output / "experiment.json", metadata)
     return 0 if len(rows) == args.warmups + args.repetitions and len(eligible) == args.repetitions else 1
 
 
@@ -421,6 +482,134 @@ def compare(args):
     return 0 if result["comparison_status"] == "eligible" else 1
 
 
+def _paired_block_interval(pairs, iterations=10000):
+    """Resample entire on/off block pairs, not individual correlated tasks."""
+    rng = random.Random(0)
+    differences, percentages = [], []
+    for _ in range(iterations):
+        selected = [pairs[rng.randrange(len(pairs))] for _ in pairs]
+        on = statistics.mean(pair[0] for pair in selected)
+        off = statistics.mean(pair[1] for pair in selected)
+        differences.append(on - off)
+        percentages.append(100 * (on - off) / off)
+
+    def bounds(values):
+        values.sort()
+        def percentile(q):
+            index = (len(values) - 1) * q
+            lower = int(index)
+            upper = min(lower + 1, len(values) - 1)
+            return values[lower] + (values[upper] - values[lower]) * (index - lower)
+        return [percentile(0.025), percentile(0.975)]
+    return {"method": "paired-block percentile bootstrap", "confidence": 0.95,
+            "resamples": iterations, "seed": 0, "pairs": len(pairs),
+            "overhead_ms": bounds(differences), "overhead_percent": bounds(percentages)}
+
+
+def compare_blocks(args):
+    root, plan, digest = _read_block_plan(args.root / "plan.json")
+    if args.output.exists():
+        raise ValueError("comparison output already exists; choose a new path")
+    reasons, block_means, configs = [], {}, set()
+    values = {"on": [], "off": []}
+    counts = {mode: {"measured_attempts": 0, "warmups": 0, "runtime_failures": 0}
+              for mode in values}
+    identities = {key: set() for key in ("task_id", "run_id")}
+    previous_end = None
+    for item in plan["schedule"]:
+        label = item["directory"]
+        directory = root / label
+        mode = item["mode"]
+        try:
+            meta = json.loads((directory / "experiment.json").read_text())
+            rows = [json.loads(line) for line in (directory / "results.jsonl").read_text().splitlines() if line]
+            policy = meta.get("measurement", {}).get("eligibility_policy", "verified")
+            if (meta.get("mode") != mode or meta.get("plan_sha256") != digest
+                    or meta.get("plan_batch") != item["batch"] or meta.get("plan_block") != item["block"]
+                    or meta.get("workload_sha256") != plan["workload_sha256"]
+                    or meta.get("repetitions") != 5 or meta.get("warmups") != 1
+                    or meta.get("timeout_seconds") != 300 or meta.get("max_steps") != 20 or policy != "runtime"):
+                reasons.append(label + ": metadata differs from plan")
+            config = meta.get("deployment", {}).get("comparable_sha256")
+            if not isinstance(config, str) or not config:
+                reasons.append(label + ": missing deployment configuration hash")
+            configs.add(config)
+            start, end = _number(meta.get("started_unix")), _number(meta.get("completed_unix"))
+            if start is None or end is None or end < start or (previous_end is not None and start < previous_end):
+                reasons.append(label + ": missing completion time or planned chronological order violated")
+            previous_end = end
+            if len(rows) != 6:
+                reasons.append(label + ": expected one warmup and five measured attempts")
+            batch_values = []
+            for position, row in enumerate(rows):
+                warmup = row.get("warmup") is True
+                if (row.get("index") != position + 1 or warmup != (position == 0)
+                        or row.get("mode") != mode or row.get("stage") != "complete"):
+                    reasons.append(label + ": invalid attempt sequence or incomplete outcome")
+                for key, seen in identities.items():
+                    identity = row.get(key)
+                    if not isinstance(identity, str) or not identity or identity in seen:
+                        reasons.append(label + ": missing or duplicate " + key)
+                    else:
+                        seen.add(identity)
+                if warmup:
+                    counts[mode]["warmups"] += 1
+                    warmed, _ = _eligibility(mode, "runtime", False, row.get("task_status"),
+                        "answer" if row.get("task_result_nonempty") is True else "",
+                        row.get("task_end_to_end_time_ms"), False,
+                        row.get("telemetry_capture_check", {}).get("captured") is True)
+                    if not warmed:
+                        reasons.append(label + ": warmup did not complete with required evidence")
+                    continue
+                counts[mode]["measured_attempts"] += 1
+                if row.get("task_status") != "Success":
+                    counts[mode]["runtime_failures"] += 1
+                captured = row.get("telemetry_capture_check", {}).get("captured") is True
+                eligible, exclusions = _eligibility(mode, "runtime", False, row.get("task_status"),
+                    "answer" if row.get("task_result_nonempty") is True else "",
+                    row.get("task_end_to_end_time_ms"), False, captured)
+                if eligible and row.get("eligible") is True:
+                    duration = _number(row["task_end_to_end_time_ms"])
+                    batch_values.append(duration)
+                    values[mode].append(duration)
+                else:
+                    reasons.append(label + ": excluded measured attempt %s (%s)" %
+                                   (row.get("index"), ", ".join(exclusions) or "saved eligibility false"))
+            if len(batch_values) == 5:
+                block_means[(item["block"], mode)] = statistics.mean(batch_values)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            reasons.append(label + ": unavailable or invalid batch (" + type(exc).__name__ + ")")
+    if len(configs) != 1:
+        reasons.append("deployment images/configuration differ across batches")
+    for mode in values:
+        if len(values[mode]) != 50 or counts[mode]["measured_attempts"] != 50 or counts[mode]["warmups"] != 10:
+            reasons.append(mode + ": requires exactly 50 eligible measured attempts and ten separate warmups")
+    pairs = [(block_means.get((block, "on")), block_means.get((block, "off"))) for block in range(1, 11)]
+    if any(on is None or off is None or off <= 0 for on, off in pairs):
+        reasons.append("ten complete block pairs with positive off means are required")
+    result = {"comparison_status": "ineligible" if reasons else "eligible", "eligibility_policy": "runtime",
+              "plan_sha256": digest, "reasons": list(dict.fromkeys(reasons)),
+              "required_per_mode": 50, "counts": counts,
+              "overhead_ms": None, "overhead_percent": None, "confidence_interval": None,
+              "block_pairs": [{"block": block, "on_mean_ms": on, "off_mean_ms": off,
+                               "difference_ms": on - off if on is not None and off is not None else None}
+                              for block, (on, off) in enumerate(pairs, 1)],
+              "limitations": "Exploratory runtime-only comparison; model/tool choices and load can vary. "
+                             "Bootstrap resamples ten block pairs and does not establish causality or lossless capture."}
+    for mode, durations in values.items():
+        result[mode] = {"eligible_repetitions": len(durations), "values_ms": durations,
+                        "mean_ms": statistics.mean(durations) if durations else None,
+                        "median_ms": statistics.median(durations) if durations else None,
+                        "stdev_ms": statistics.stdev(durations) if len(durations) > 1 else None}
+    if not reasons:
+        result["overhead_ms"] = result["on"]["mean_ms"] - result["off"]["mean_ms"]
+        result["overhead_percent"] = 100 * result["overhead_ms"] / result["off"]["mean_ms"]
+        result["confidence_interval"] = _paired_block_interval(pairs)
+    _write(args.output, result)
+    print(json.dumps(result, indent=2))
+    return 0 if not reasons else 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -436,14 +625,21 @@ def main(argv=None):
     run_parser.add_argument("--timeout", type=int, default=300)
     run_parser.add_argument("--max-steps", type=int, default=20)
     run_parser.add_argument("--eligibility", choices=("verified", "runtime"), default="verified")
+    run_parser.add_argument("--plan", type=Path)
+    run_parser.add_argument("--batch", type=int)
     compare_parser = sub.add_parser("compare", help="compare the on/off summaries")
     compare_parser.add_argument("--on", type=Path, required=True)
     compare_parser.add_argument("--off", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path, required=True)
+    plan_parser = sub.add_parser("plan", help="create a new balanced 50-per-mode experiment plan")
+    plan_parser.add_argument("--output", type=Path, required=True)
+    blocks_parser = sub.add_parser("compare-blocks", help="aggregate all twenty planned batches")
+    blocks_parser.add_argument("--root", type=Path, required=True)
+    blocks_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    if args.command == "compare":
+    if args.command in {"compare", "compare-blocks", "plan"}:
         try:
-            return compare(args)
+            return {"compare": compare, "compare-blocks": compare_blocks, "plan": plan_blocks}[args.command](args)
         except Exception as exc:
             print(json.dumps({"state": "failed", "error": safe_error(exc)}), file=sys.stderr)
             return 2

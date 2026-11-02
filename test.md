@@ -438,6 +438,70 @@ kubectl -n agentic-ai rollout status daemonset/kernel-telemetry --timeout=300s
 
 ## Next checkpoint
 
+### Larger runtime-only experiment: 50 measured tasks per mode
+
+Create a new plan on **ryzen01**, preserving all prior batches:
+
+```sh
+cd /home/agentic/agentic
+SERIES_ROOT="$(mktemp -d "$PWD/benchmark-results/telemetry-50.XXXXXX")/series"
+python3 scripts/run_telemetry_comparison.py plan --output "$SERIES_ROOT"
+```
+
+`plan.json` fixes ten pairs of five-task batches before any submission. Odd
+pairs use on then off; even pairs use off then on. There are twenty batches,
+each with its own excluded warmup: fifty measured attempts and ten warmups per
+mode. Two adjacent batches may use the same mode; they still have separate
+warmups. Do not restart workloads unnecessarily between same-mode batches.
+
+Before each batch, the operator checks empty queues, applies only its planned
+mode switches, waits for all relevant rollouts, checks worker-to-inference
+`/health`, and saves a fresh ready deployment snapshot. Preserve every snapshot
+under a different name. Do not change images, model, resource settings, or
+background monitoring during the experiment. Keep an eye on free disk space.
+The runner never changes cluster state or transfers files itself.
+
+For example, after preparing and copying the first on snapshot to
+`$SERIES_ROOT/snapshot-01.json`, run on **ryzen01**:
+
+```sh
+python3 scripts/run_telemetry_comparison.py run \
+  --plan "$SERIES_ROOT/plan.json" --batch 1 \
+  --mode on --eligibility runtime \
+  --deployment-snapshot "$SERIES_ROOT/snapshot-01.json" \
+  --workspace-root "$PWD/benchmark-workspaces" \
+  --output "$SERIES_ROOT/block-01/on" \
+  --repetitions 5 --warmups 1 --timeout 300 --max-steps 20
+```
+
+Follow the exact mode and directory for each subsequent batch in `plan.json`.
+The runner checks the arguments against the plan and requires the preceding
+batch to have finished all attempts before it can submit another batch.
+Uncertain outcomes require diagnosis, not resubmission. A terminal failure
+stays in the dataset; do not add replacements or combine earlier experiments.
+
+After all twenty batches, aggregate without modifying any batch:
+
+```sh
+python3 scripts/run_telemetry_comparison.py compare-blocks \
+  --root "$SERIES_ROOT" --output "$SERIES_ROOT/comparison.json"
+```
+
+The report includes individual measured durations, means, medians, sample
+standard deviations, failures, and paired block mean differences. Overhead and
+its interval require all fifty measured attempts per mode to meet runtime-only
+eligibility, successful separate warmups, matching settings, and on-mode capture.
+It checks task/run identity uniqueness and recorded chronological batch order.
+Failures or missing batches produce an ineligible report without replacing data.
+
+The 95% percentile bootstrap interval resamples the ten on/off block pairs
+together, using 10,000 resamples and seed zero. This treats blocks, not all one
+hundred tasks, as independent resampling units. It is exploratory: correlated
+load, cache drift, and varying model/tool paths can still affect the result.
+An interval containing zero does not establish a direction of change, and a
+negative estimate does not prove telemetry accelerates execution. Restore the
+usual on settings after a quiet queue window and verify the rollouts.
+
 Paste the launcher output, followed by `result.json` and `react_steps.json`.
 We will inspect the actual cycles under that one run ID, then locate that run's
 trace in Phoenix. No additional user prompts are needed to advance the agent's
