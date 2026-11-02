@@ -15,17 +15,17 @@ from export_telemetry_sample import Gateway, export_run, read_token, safe_error
 
 
 DATA = "region,amount\nNorth,100\nSouth,80\nNorth,50\nWest,70\nSouth,20\nWest,30\n"
-SEED_ANALYZER = '''import csv\nimport json\nimport sys\n\nwith open(sys.argv[1], newline="") as stream:\n    rows = list(csv.DictReader(stream))\ntotals = {}\nfor row in rows:\n    totals[row["region"]] = totals.get(row["region"], 0) + int(row["amount"])\ntotal = sum(totals.values())\nprint(json.dumps({"count": len(rows), "total": total, "average": total // len(rows),\n                  "totals_by_region": totals}))\n'''
+SEED_ANALYZER = '''import argparse\nimport csv\nimport json\n\nparser = argparse.ArgumentParser()\nparser.add_argument("input")\nparser.add_argument("--region")\nparser.add_argument("--output")\nargs = parser.parse_args()\n\nwith open(args.input, newline="") as stream:\n    rows = [row for row in csv.DictReader(stream)\n            if args.region is None or row["region"] == args.region]\ntotals = {}\nfor row in rows:\n    try:\n        amount = float(row["amount"])\n    except (TypeError, ValueError):\n        parser.error("each row must have a numeric amount")\n    totals[row["region"]] = totals.get(row["region"], 0) + amount\ntotal = sum(totals.values())\nreport = {"count": len(rows), "total": total,\n          "average": total // len(rows) if rows else None,\n          "totals_by_region": totals}\ntext = json.dumps(report)\nif args.output:\n    with open(args.output, "w") as stream:\n        stream.write(text + "\\n")\nprint(text)\n'''
 SEED_TESTS = '''import csv\nimport json\nimport subprocess\nimport sys\nimport tempfile\nimport unittest\nfrom pathlib import Path\n\nSCRIPT = Path(__file__).with_name("analyze.py")\n\ndef run(rows):\n    with tempfile.TemporaryDirectory() as directory:\n        data = Path(directory) / "input.csv"\n        with data.open("w", newline="") as stream:\n            writer = csv.writer(stream)\n            writer.writerow(["region", "amount"])\n            writer.writerows(rows)\n        result = subprocess.run([sys.executable, str(SCRIPT), str(data)],\n                                text=True, capture_output=True, timeout=10)\n        return result\n\nclass AnalyzerTests(unittest.TestCase):\n    def test_dataset_totals(self):\n        result = run([("North",100),("South",80),("North",50),("West",70),("South",20),("West",30)])\n        self.assertEqual(result.returncode, 0)\n        self.assertEqual(json.loads(result.stdout), {"count":6,"total":350,"average":350/6,\n            "totals_by_region":{"North":150,"South":100,"West":100}})\n    def test_decimal_refund_and_empty(self):\n        result = run([("A",1.5),("A",-0.25),("B",2.0)])\n        self.assertEqual(json.loads(result.stdout)["total"], 3.25)\n        empty = run([])\n        self.assertEqual(json.loads(empty.stdout), {"count":0,"total":0,"average":None,"totals_by_region":{}})\n    def test_bad_or_missing_amount_rejected(self):\n        for rows in [[("A","bad")], [("A",)]]:\n            self.assertNotEqual(run(rows).returncode, 0)\n\nif __name__ == "__main__":\n    unittest.main()\n'''
 PROMPT = (
-    "Use Python 3.8-compatible standard-library code. "
-    "Inspect the existing analyze.py, sales.csv, and test_analyze.py. Repair the CSV analysis "
-    "tool so it meets the tests and supports the requested interface: positional CSV input, "
-    "optional --region filter, optional --output JSON file, and JSON output with count, total, "
-    "average (null for empty input), and totals_by_region. Reject malformed/missing amounts. "
-    "Run the tests, fix any failures, then run the tool filtered to North and write report.json. "
-    "Use the provided tools for file edits and command execution; do not install packages, use "
-    "the internet, delegate, or merely describe commands. Finish with a short summary."
+    "Use the provided tools to do this in multiple ReAct steps: first inspect analyze.py and "
+    "test_analyze.py, then make the smallest edit needed. The analyzer already supports its "
+    "required CSV interface and validation; its average is wrong because it uses integer "
+    "division. Change only the average calculation to produce a fractional average while "
+    "keeping empty input as null. Then run `python3 -m unittest -v test_analyze` and "
+    "`python3 analyze.py sales.csv --region North --output report.json`. Read report.json "
+    "and finish with a brief summary of observed results. Preserve the rest of the program; do not install "
+    "packages, use the internet, delegate, or merely describe commands."
 )
 _OWNED_OUTPUTS = set()
 

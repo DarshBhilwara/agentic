@@ -14,8 +14,8 @@ until the task finishes, fails or reaches its limit:
 One session → one submitted task → one program/run ID
 
 step 1: model request → inspect files → tool observations
-step 2: model request → repair code / execute commands → observations
-step 3+: model request → further tools or final answer
+step 2: model request → make the focused repair → observations
+step 3+: model request → run checks / inspect report → final answer
 ```
 
 A ReAct step here means one model request and its associated tool calls and
@@ -136,13 +136,16 @@ Use the Python environment that already has `requests`; substitute
 
 The launcher:
 
-1. Creates a fresh child workspace containing a small CSV dataset, an
-   intentionally defective analyzer and standard-library tests.
+1. Creates a fresh child workspace containing a small CSV dataset and an
+   analyzer with one intentional bug: integer division truncates its average.
 2. Initializes a clean Git baseline **only inside that new sample workspace**.
    This is fixture preparation, outside the captured program; the platform
    repository and existing user workspaces are not committed or modified.
-3. Creates one fresh session and submits one coding task. The agent must inspect,
-   repair and verify the existing program using real workspace tools.
+3. Creates one fresh session and submits one coding task. The agent must inspect
+   the files, change only the average calculation, run the standard-library tests,
+   execute a North-filtered report command, and read the resulting report using
+   real workspace tools. This keeps the requested code change small while
+   retaining several observable ReAct steps; generation length can still vary.
 4. Saves the accepted session/task/program/run IDs before waiting for completion.
 5. Leaves subsequent model/tool cycles to the existing worker loop. It does not
    submit a new user request for each cycle or silently resubmit on failure.

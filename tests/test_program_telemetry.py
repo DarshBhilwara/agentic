@@ -15,10 +15,11 @@ from program_telemetry import ProgramTelemetry, StepLimitExceeded, TaskTimeout, 
 from telemetry_ledger import TelemetryLedger
 
 
-def completion(calls=None, *, usage=True, finish="stop"):
+def completion(calls=None, *, usage=True, finish=None):
+    finish = finish or ("tool_calls" if calls else "stop")
     return ChatCompletion.model_validate({
         "id": "chatcmpl-test", "object": "chat.completion", "created": 1, "model": "qwen",
-        "choices": [{"index": 0, "finish_reason": "tool_calls" if calls else finish,
+        "choices": [{"index": 0, "finish_reason": finish,
                      "message": {"role": "assistant", "content": None if calls else "Done", "tool_calls": calls}}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110} if usage else None})
 
@@ -230,6 +231,67 @@ def test_recovery_fails_clearly_when_required_tool_is_disabled(tmp_path, fake_mo
         with pytest.raises(RuntimeError, match="Required recovery tool is unavailable: write_file"):
             agent.run("edit", "alice", workspace=str(tmp_path), require_workspace_changes=True,
                       enabled_tools=["read_file"])
+
+
+def test_truncated_partial_tool_call_recovers_without_dispatch(tmp_path, fake_model):
+    partial = tool("write_file", '{"path":"partial.py","content":"unfinished"}', "partial-call")
+    real = tool("write_file", '{"path":"fixed.py","content":"ok"}', "fixed-call")
+    fake_model.side_effect = [completion([partial], finish="length"), completion([real]), completion()]
+    events = []
+    measured = ProgramTelemetry("truncated", on_step=lambda step: events.append(step)
+                                if step["step_status"] != "Running" else None)
+    from unittest.mock import patch
+    with patch.object(agent, "workspace_has_changes", side_effect=[False, True]):
+        result, conversation = agent.run("edit", "alice", workspace=str(tmp_path), measurements=measured,
+                                         require_workspace_changes=True)
+    assert result == "Done"
+    assert not (tmp_path / "partial.py").exists()
+    assert (tmp_path / "fixed.py").read_text() == "ok"
+    assert events[0]["step_status"] == "Failed"
+    assert all("partial-call" not in str(message) for message in fake_model.call_args_list[1].kwargs["messages"])
+    assert all("partial-call" not in str(message) for message in conversation)
+    assert fake_model.call_args_list[1].kwargs["tool_choice"] == {
+        "type": "function", "function": {"name": "write_file"}}
+
+
+def test_truncated_response_after_write_recovers_with_execute_command(tmp_path, fake_model):
+    write = tool("write_file", '{"path":"fixed.py","content":"ok"}', "write-call")
+    command = tool("execute_command", '{"command":"cat fixed.py"}', "verify-call")
+    fake_model.side_effect = [completion([write]), completion(finish="length"),
+                              completion([command]), completion()]
+    from unittest.mock import patch
+    with patch.object(agent, "workspace_has_changes", return_value=True):
+        result, _ = agent.run("edit and verify", "alice", workspace=str(tmp_path),
+                              require_workspace_changes=True, require_command_execution=True)
+    assert result == "Done"
+    assert fake_model.call_args_list[2].kwargs["tool_choice"] == {
+        "type": "function", "function": {"name": "execute_command"}}
+
+
+def test_second_unforced_truncation_after_forced_write_fails(tmp_path, fake_model):
+    write = tool("write_file", '{"path":"fixed.py","content":"ok"}', "write-call")
+    fake_model.side_effect = [completion(finish="length"), completion([write]),
+                              completion(finish="length")]
+    from unittest.mock import patch
+    with patch.object(agent, "workspace_has_changes", side_effect=[False, True]):
+        with pytest.raises(RuntimeError, match="Model response repeatedly truncated before required coding action"):
+            agent.run("edit", "alice", workspace=str(tmp_path), require_workspace_changes=True,
+                      require_command_execution=True)
+
+
+def test_truncated_forced_recovery_fails_explicitly(tmp_path, fake_model):
+    fake_model.side_effect = [completion(finish="length"),
+                              completion([tool("write_file")], finish="length")]
+    from unittest.mock import patch
+    with patch.object(agent, "workspace_has_changes", return_value=False):
+        with pytest.raises(RuntimeError, match="truncated while required tool call was forced: write_file"):
+            agent.run("edit", "alice", workspace=str(tmp_path), require_workspace_changes=True)
+
+
+def test_truncated_response_fails_when_no_coding_constraint_is_unmet(tmp_path, fake_model):
+    fake_model.return_value = completion(finish="length")
+    with pytest.raises(RuntimeError, match="Model response truncated by token limit"):
+        agent.run("summarize", "alice", workspace=str(tmp_path))
 
 
 def test_request_join_does_not_mix_concurrent_programs():

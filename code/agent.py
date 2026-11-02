@@ -603,7 +603,7 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
     """
     active_step = {"manager": None, "record": None}
     rejected_completions = {"workspace_unchanged": 0, "command_not_executed": 0,
-                            "command_not_successful": 0}
+                            "command_not_successful": 0, "response_truncated": 0}
 
     def close_step(exc_info=(None, None, None)):
         manager = active_step["manager"]
@@ -692,8 +692,6 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
                 calls = message.tool_calls or []
                 tool_calls = [{"id": call.id, "name": call.function.name,
                                "arguments": call.function.arguments} for call in calls]
-                if forced_tool_name and (not tool_calls or any(c["name"] != forced_tool_name for c in tool_calls)):
-                    raise RuntimeError("Model did not return the required structured tool call: " + forced_tool_name)
                 decision = intent_decision([call["name"] for call in tool_calls])
                 for key, value in decision.items():
                     value = json.dumps(value) if isinstance(value, list) else value
@@ -710,9 +708,50 @@ def _build_agent_graph(*, client, workspace, tools, measurements, redis_client,
                                                separators=(",", ":"))
                     })
 
-            messages = [*state["messages"], message.model_dump(exclude_none=True)]
             if response.choices[0].finish_reason == "length":
-                raise RuntimeError("Model response truncated by token limit")
+                # A truncated response may contain a partial tool call. Never
+                # dispatch it or add it to conversation history.
+                if forced_tool_name:
+                    raise RuntimeError("Model response truncated while required tool call was forced: " + forced_tool_name)
+                if require_workspace_changes and not workspace_has_changes(workspace):
+                    reject_reason = "workspace_unchanged"
+                elif require_command_execution and not (
+                        state.get("last_command_status") == "Success" and
+                        state.get("last_command_order", 0) > state.get("last_write_attempt_order", 0)):
+                    reject_reason = ("command_not_successful" if state.get("last_command_order", 0) > 0
+                                     else "command_not_executed")
+                else:
+                    reject_reason = ""
+                if not reject_reason:
+                    raise RuntimeError("Model response truncated by token limit")
+                rejected_completions["response_truncated"] += 1
+                record.actual_transition = "model->model"
+                record.expected_transition = "model->tools"
+                record.constraint_violation = True
+                _emit("agent.completion.rejected", attributes={
+                    **attrs, "reason": reject_reason, "response_truncated": True,
+                    "rejected_completions": rejected_completions["response_truncated"],
+                }, severity="error")
+                _emit("procedural_graph.observed", attributes={"node": f"model:{step_index}",
+                      "previous_node": previous_node, "action": "model.response_truncated",
+                      "recovery_reason": reject_reason})
+                close_step((RuntimeError, RuntimeError("Model response truncated by token limit"), None))
+                if rejected_completions["response_truncated"] >= 2:
+                    raise RuntimeError("Model response repeatedly truncated before required coding action")
+                required_tool = "write_file" if reject_reason == "workspace_unchanged" else "execute_command"
+                if required_tool not in {t["function"]["name"] for t in tools}:
+                    raise RuntimeError("Required recovery tool is unavailable: " + required_tool)
+                recovery_prompt = ("Your previous response was truncated. Make the required edit now using an actual "
+                                   "structured write_file call. Do not print code or tool-call markup.") if required_tool == "write_file" else (
+                                   "Your previous response was truncated. Run an actual verification command using a "
+                                   "structured execute_command call. Do not print command text or tool-call markup.")
+                return {"messages": [*state["messages"], {"role": "user", "content": recovery_prompt}],
+                        "step_index": step_index, "tool_calls": [], "route": "model",
+                        "previous_node": f"model:{step_index}", "forced_tool_name": required_tool,
+                        "recovery_reason": reject_reason}
+            if forced_tool_name and (not tool_calls or any(c["name"] != forced_tool_name for c in tool_calls)):
+                raise RuntimeError("Model did not return the required structured tool call: " + forced_tool_name)
+            messages = [*state["messages"], message.model_dump(exclude_none=True)]
             if calls:
                 _emit("procedural_graph.observed", attributes={"node": f"tools:{step_index}",
                       "previous_node": f"model:{step_index}", "action": "tool.dispatch"})
