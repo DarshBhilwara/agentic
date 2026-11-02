@@ -264,6 +264,19 @@ Engine timings overlap model wall time; unsupported KV measurements remain null.
 
 ## 6. Compare end-to-end runtime with telemetry on and off
 
+For the current overhead-only experiment, pass `--eligibility runtime` to both
+`run` commands. Repeat the same task unchanged: a normal runtime Success with
+a nonempty answer and mandatory end-to-end timing qualifies even if independent
+correctness checks fail. Correctness results are still saved as diagnostics.
+Warmups remain excluded, runtime failures are retained and not replaced, and
+on-mode capture plus matching workload/configuration are still required. This
+measures runtime for returned answers, not time to a correct solution. Different
+answer lengths and tool paths remain a source of variation.
+
+The default `--eligibility verified` keeps the stricter correctness criterion
+described below. Never mix the two policies in one on/off comparison or relabel
+old batches to make them eligible.
+
 The comparison normalizes only the experiment mode flags in both regular and
 init containers. Other init-container settings remain part of the configuration
 hash. Earlier reports produced before this normalization fix remain historical
@@ -304,7 +317,8 @@ time as secondary metrics. The client timer includes polling (up to two seconds
 of quantization); the primary metric ends before final HSET transport and
 asynchronous export flushing. Fixture setup and independent host checks are
 outside task timing. Each successful task is independently checked;
-failed or incorrect runs are retained in the output but excluded from the mean.
+failed runs are retained but excluded from the mean. Incorrect returned answers
+are excluded only under `--eligibility verified`.
 No failed run is silently replaced. The comparison is exploratory with five
 samples and may be affected by model/server load and output variation.
 
@@ -400,7 +414,7 @@ cat "$COMPARISON_ROOT/comparison.json"
 
 The report gives each mode's mean, median, sample standard deviation, and
 `(on mean - off mean) / off mean * 100`. It withholds the overhead estimate if
-either side has fewer than five independently verified successful runs or the
+either side has fewer than five runs eligible under its selected policy or the
 deployment image/spec hashes differ. Keep all attempt workspaces and JSONL
 records, including failures.
 

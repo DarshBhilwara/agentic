@@ -10,11 +10,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import run_telemetry_comparison as comparison
 
 
-def _batch(path, mode, values, config="same"):
+def _batch(path, mode, values, config="same", eligibility="verified"):
     path.mkdir()
     (path / "experiment.json").write_text(json.dumps({
         "mode": mode, "repetitions": 5, "warmups": 1,
         "timeout_seconds": 300, "max_steps": 20,
+        "measurement": {"eligibility_policy": eligibility},
         "workload_sha256": "same-workload",
         "deployment": {"comparable_sha256": config}}))
     rows = [{"warmup": False, "eligible": True, "task_end_to_end_time_ms": value}
@@ -62,6 +63,61 @@ def test_compare_withholds_overhead_when_task_settings_differ(tmp_path):
     result = json.loads(output.read_text())
     assert result["comparison_status"] == "ineligible"
     assert result["overhead_ms"] is None
+
+
+def test_compare_withholds_overhead_when_eligibility_policies_differ(tmp_path):
+    on, off, output = tmp_path / "on", tmp_path / "off", tmp_path / "comparison.json"
+    _batch(on, "on", [120] * 5, eligibility="runtime")
+    _batch(off, "off", [100] * 5, eligibility="verified")
+
+    assert comparison.compare(NS(on=on, off=off, output=output)) == 1
+    result = json.loads(output.read_text())
+    assert result["batch_checks"]["eligibility_policy"] is False
+    assert result["eligibility_policy"] is None
+    assert result["comparison_status"] == "ineligible"
+
+
+def test_runtime_eligibility_uses_returned_answer_not_verifier(tmp_path):
+    eligible, reasons = comparison._eligibility(
+        "off", "runtime", False, "Success", "incorrect but nonempty", 123.0, False, False)
+
+    assert eligible is True
+    assert reasons == []
+
+
+def test_runtime_verifier_exception_is_diagnostic_only(tmp_path, monkeypatch):
+    def fail(_workspace):
+        raise OSError("host verification unavailable")
+    monkeypatch.setattr(comparison, "_host_verify", fail)
+    result = comparison._verify_attempt(tmp_path, "Success", "runtime")
+    assert result["passed"] is False
+    assert result["diagnostic_error"]["type"] == "OSError"
+    with pytest.raises(OSError):
+        comparison._verify_attempt(tmp_path, "Success", "verified")
+
+
+def test_runtime_compare_reports_policy_and_overhead(tmp_path):
+    on, off = tmp_path / "on", tmp_path / "off"
+    _batch(on, "on", [110] * 5, eligibility="runtime")
+    _batch(off, "off", [100] * 5, eligibility="runtime")
+    output = tmp_path / "comparison.json"
+    assert comparison.compare(NS(on=on, off=off, output=output)) == 0
+    result = json.loads(output.read_text())
+    assert result["eligibility_policy"] == "runtime"
+    assert result["overhead_percent"] == 10
+
+
+@pytest.mark.parametrize(("status", "answer", "timer", "expected_reason"), [
+    ("Success", "  \n", 123.0, "empty_task_result"),
+    ("Failed", "some answer", 123.0, "runtime_not_successful"),
+    ("Success", "some answer", None, "missing_primary_timing"),
+])
+def test_runtime_eligibility_excludes_blank_failed_or_untimed_tasks(status, answer, timer, expected_reason):
+    eligible, reasons = comparison._eligibility(
+        "off", "runtime", False, status, answer, timer, False, False)
+
+    assert eligible is False
+    assert expected_reason in reasons
 
 
 def _snapshot(tmp_path):

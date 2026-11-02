@@ -181,6 +181,36 @@ def _workload_sha256():
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _eligibility(mode, policy, warmup, task_status, task_result, primary_ms,
+                 verification_passed, capture_verified):
+    """Return a policy-specific eligibility decision and its exclusion reasons."""
+    reasons = []
+    if warmup:
+        reasons.append("warmup")
+    if task_status != "Success":
+        reasons.append("runtime_not_successful")
+    if policy == "runtime" and not (isinstance(task_result, str) and task_result.strip()):
+        reasons.append("empty_task_result")
+    if _number(primary_ms) is None:
+        reasons.append("missing_primary_timing")
+    if policy == "verified" and verification_passed is not True:
+        reasons.append("independent_verification_failed")
+    if mode == "on" and capture_verified is not True:
+        reasons.append("telemetry_capture_unverified")
+    return not reasons, reasons
+
+
+def _verify_attempt(workspace, task_status, policy):
+    if task_status != "Success":
+        return {"passed": False, "skipped_reason": "runtime_task_not_successful", "commands": []}
+    try:
+        return _host_verify(workspace)
+    except Exception as exc:
+        if policy != "runtime":
+            raise
+        return {"passed": False, "diagnostic_error": safe_error(exc), "commands": []}
+
+
 def run_mode(args):
     config = snapshot_metadata(args.deployment_snapshot, args.mode)
     output = args.output.expanduser().resolve()
@@ -199,7 +229,10 @@ def run_mode(args):
                 "measurement": {"primary": "worker task_end_to_end_time_ms, includes queue wait and synchronous ledger finalization",
                                 "secondary": "worker task_completion_time_ms, existing task timing before final ledger writes",
                                 "client_observed": "monotonic submit-to-terminal time, includes polling interval",
-                                "eligibility": "runtime Success and independent fixture verification passed",
+                                "eligibility_policy": args.eligibility,
+                                "eligibility": ("terminal Success, nonempty task result, and finite primary timer; verifier is diagnostic only"
+                                                if args.eligibility == "runtime" else
+                                                "terminal Success, independent fixture verification passed, and finite primary timer"),
                                 "order": "sequential; one warmup before measured runs"}}
     _write(output / "experiment.json", metadata)
     rows = []
@@ -238,6 +271,7 @@ def run_mode(args):
                 raise TimeoutError("task did not reach terminal status; do not resubmit")
             row["task_status"] = task.get("task_status", task.get("status"))
             row["runtime_status"] = task.get("status")
+            row["task_result_nonempty"] = isinstance(task.get("result"), str) and bool(task["result"].strip())
             row["task_end_to_end_time_ms"] = _number(task.get("task_end_to_end_time_ms"))
             row["task_completion_time_ms"] = _number(task.get("task_completion_time_ms"))
             row["client_submit_to_terminal_ms"] = (time.monotonic() - submitted_at) * 1000
@@ -246,22 +280,12 @@ def run_mode(args):
                 key: task.get(key) for key in ("id", "task_id", "run_id", "status", "task_status",
                     "error", "task_end_to_end_time_ms", "task_completion_time_ms")})
             row["stage"] = "verification"
-            verification = _host_verify(workspace) if row["task_status"] == "Success" else {
-                "passed": False, "skipped_reason": "runtime_task_not_successful", "commands": []}
+            verification = _verify_attempt(workspace, row["task_status"], args.eligibility)
             _write(output / ("verification-%02d.json" % (index + 1)), verification)
             row["verification"] = {"passed": verification.get("passed", False),
                                    "checks": [{"name": item.get("name"), "returncode": item.get("returncode"),
                                                "passed": item.get("passed")}
                                               for item in verification.get("commands", [])]}
-            row["exclusion_reasons"] = []
-            if warmup:
-                row["exclusion_reasons"].append("warmup")
-            if row["task_status"] != "Success":
-                row["exclusion_reasons"].append("runtime_not_successful")
-            if verification.get("passed") is not True:
-                row["exclusion_reasons"].append("independent_verification_failed")
-            if row["task_end_to_end_time_ms"] is None:
-                row["exclusion_reasons"].append("missing_primary_timing")
             if args.mode == "on":
                 try:
                     evidence = output / ("evidence-%02d" % (index + 1))
@@ -291,13 +315,10 @@ def run_mode(args):
                                              for key, count in scopes.items()))}
                 except Exception as exc:
                     row["telemetry_export_error"] = safe_error(exc)
-                if row.get("telemetry_capture_check", {}).get("captured") is not True:
-                    row["exclusion_reasons"].append("telemetry_capture_unverified")
-            row["eligible"] = bool(not warmup and row["task_status"] == "Success" and
-                                    verification.get("passed") is True and
-                                    row["task_end_to_end_time_ms"] is not None and
-                                    (args.mode == "off" or
-                                     row.get("telemetry_capture_check", {}).get("captured") is True))
+            capture_verified = row.get("telemetry_capture_check", {}).get("captured") is True
+            row["eligible"], row["exclusion_reasons"] = _eligibility(
+                args.mode, args.eligibility, warmup, row["task_status"], task.get("result"),
+                row["task_end_to_end_time_ms"], verification.get("passed"), capture_verified)
             row["stage"] = "complete"
         except Exception as exc:
             row["runner_error"] = safe_error(exc)
@@ -343,21 +364,28 @@ def compare(args):
     off_meta = json.loads((args.off / "experiment.json").read_text())
     on_rows = [json.loads(line) for line in (args.on / "results.jsonl").read_text().splitlines() if line]
     off_rows = [json.loads(line) for line in (args.off / "results.jsonl").read_text().splitlines() if line]
+    on_policy = on_meta.get("eligibility_policy", on_meta.get("measurement", {}).get("eligibility_policy", "verified"))
+    off_policy = off_meta.get("eligibility_policy", off_meta.get("measurement", {}).get("eligibility_policy", "verified"))
     meta_checks = {
         "mode_labels": on_meta.get("mode") == "on" and off_meta.get("mode") == "off",
         "workload": on_meta.get("workload_sha256") == off_meta.get("workload_sha256"),
         "timeout": on_meta.get("timeout_seconds") == off_meta.get("timeout_seconds"),
         "max_steps": on_meta.get("max_steps") == off_meta.get("max_steps"),
         "requested_repetitions": on_meta.get("repetitions") == 5 and off_meta.get("repetitions") == 5,
+        "eligibility_policy": on_policy == off_policy,
     }
     on_values = [row["task_end_to_end_time_ms"] for row in on_rows if row.get("eligible") and not row.get("warmup")]
     off_values = [row["task_end_to_end_time_ms"] for row in off_rows if row.get("eligible") and not row.get("warmup")]
-    on_capture_count = sum(row.get("eligible") and row.get("telemetry_capture_check", {}).get("captured") is True
+    on_capture_count = sum(row.get("telemetry_capture_check", {}).get("captured") is True
                            for row in on_rows if not row.get("warmup"))
+    on_eligible_capture_count = sum(row.get("eligible") and row.get("telemetry_capture_check", {}).get("captured") is True
+                                    for row in on_rows if not row.get("warmup"))
     result = {"on_config_sha256": on_meta["deployment"]["comparable_sha256"],
               "off_config_sha256": off_meta["deployment"]["comparable_sha256"],
               "on_eligible": len(on_values), "off_eligible": len(off_values),
-              "on_capture_verified": on_capture_count, "on_capture_export_errors": sum(
+              "eligibility_policy": on_policy if on_policy == off_policy else None,
+              "on_capture_verified": on_capture_count,
+              "on_eligible_capture_verified": on_eligible_capture_count, "on_capture_export_errors": sum(
                   bool(row.get("telemetry_export_error")) for row in on_rows if not row.get("warmup")),
               "batch_checks": meta_checks,
               "required_per_mode": 5, "on_mean_ms": statistics.mean(on_values) if on_values else None,
@@ -368,7 +396,7 @@ def compare(args):
               "off_stdev_ms": statistics.stdev(off_values) if len(off_values) > 1 else None}
     same = result["on_config_sha256"] == result["off_config_sha256"]
     enough = result["on_eligible"] == 5 and result["off_eligible"] == 5
-    captures = on_capture_count >= 5
+    captures = on_eligible_capture_count >= 5
     same_task_settings = all(meta_checks.values())
     if same and enough and captures and same_task_settings and result["off_mean_ms"] > 0:
         result["overhead_ms"] = result["on_mean_ms"] - result["off_mean_ms"]
@@ -380,9 +408,10 @@ def compare(args):
         result["comparison_status"] = "ineligible"
         reasons = []
         if not same: reasons.append("comparable deployment images/config differ")
-        if not enough: reasons.append("fewer than five independently verified successful runs per mode")
-        if not captures: reasons.append("fewer than five on-mode runs exported program and kernel telemetry")
-        if not same_task_settings: reasons.append("mode, workload, timeout, max-steps or repetition settings differ")
+        if not enough:
+            reasons.append("fewer than five %s-eligible runs per mode" % on_policy)
+        if not captures: reasons.append("fewer than five eligible on-mode runs exported program and kernel telemetry")
+        if not same_task_settings: reasons.append("mode, workload, timeout, max-steps, repetition or eligibility-policy settings differ")
         if result["off_mean_ms"] == 0: reasons.append("off-mode mean runtime is zero")
         result["reason"] = "; ".join(reasons)
     if args.output.exists():
@@ -406,6 +435,7 @@ def main(argv=None):
     run_parser.add_argument("--warmups", type=int, default=1)
     run_parser.add_argument("--timeout", type=int, default=300)
     run_parser.add_argument("--max-steps", type=int, default=20)
+    run_parser.add_argument("--eligibility", choices=("verified", "runtime"), default="verified")
     compare_parser = sub.add_parser("compare", help="compare the on/off summaries")
     compare_parser.add_argument("--on", type=Path, required=True)
     compare_parser.add_argument("--off", type=Path, required=True)

@@ -288,17 +288,25 @@ See [`GUI.md`](GUI.md) for startup, API routes, report bounds, and read-only dis
 
 ## Runtime overhead comparisons
 
+The comparison runner supports an explicit `--eligibility runtime` policy for
+overhead-only experiments: runtime Success, a nonempty answer, and mandatory
+timing are required, while independent correctness checks remain diagnostic.
+Both batches must select the same policy. The default `verified` policy retains
+the correctness requirements described below. Neither policy retries failed
+attempts or includes warmups; both require matching configuration and on-mode
+capture. A runtime-only result concerns returned answers, not verified solutions.
+
 The end-to-end procedure is documented in [`test.md`](test.md). `scripts/run_telemetry_sample.py` runs the single small CSV repair task: inspect the existing files, fix floor division in the average, run tests, generate a North-filtered JSON report and read it. Suitability requires independent correctness verification, at least two actual tool-bearing steps, and a successful final no-tool step. A single successful sample establishes evidence for that path; it is not an overhead estimate.
 
 `scripts/run_telemetry_comparison.py` separately runs the same task sequentially with task telemetry on and off, exactly five measured attempts per mode and one separate warmup by default. It records workload and deployment configuration hashes and rejects incompatible comparisons. Use the same image/configuration, model, timeout, step budget and verification criteria, keep background host load stable, and retain each repetition's outputs.
 
 - Primary measurement: worker `task_end_to_end_time_ms`, which includes queue wait and synchronous ledger finalization. Compare per-run values and report mean, median, spread, and percent change; retain individual repetitions because five observations are a small sample.
 - Secondary measurements: `task_completion_time_ms`, client-observed submit-to-terminal time, and measured tool/LLM/inference timing. Client time includes polling cadence. Do not substitute it for the worker primary metric.
-- Include a repetition in the eligible comparison only when runtime status is `Success`, independent fixture verification passed, and required telemetry evidence/identity checks are complete. Keep failed, timed-out, unverified, incomplete, and warmup runs visible in raw results but out of the eligible timing statistic; record their exclusion reason.
+- Under the default verified policy, include a repetition only when runtime status is `Success`, independent fixture verification passed, and required telemetry evidence/identity checks are complete. Runtime-only policy accepts incorrect returned answers as described above. Keep all attempts and their exclusion reasons visible, including failures and warmups.
 - Preserve a constant host/native metrics baseline. Changing kernel or inference switches requires applying/rolling out the corresponding manifests and confirming effective pod settings before measuring; do not compare mixed configurations. Run the paired modes close together and avoid unrelated load changes.
 - No numeric overhead result is implied by the implementation or documentation. The comparison must be executed on the target deployment. Deployment and runtime validation of the current changes have not been confirmed; past sample traces only demonstrate telemetry delivery for those particular runs.
 
-The runner retains failed/incorrect attempts and does not automatically replace them. It withholds an eligible estimate unless there are exactly five verified successes per mode, demonstrated on-mode capture, matching workload/settings and matching comparable deployment images/configuration. Off-mode correctness checks do not require suppressed program steps or kernel records. After both batches, restore the on settings in a quiet window.
+The runner retains all attempts and does not automatically replace them. It withholds an eligible estimate unless there are exactly five successes meeting the selected policy per mode, demonstrated on-mode capture, matching workload/settings/policy and matching comparable deployment images/configuration. Off-mode correctness checks do not require suppressed program steps or kernel records. After both batches, restore the on settings in a quiet window.
 
 ```text
 overhead_ms = mean_on_ms - mean_off_ms
